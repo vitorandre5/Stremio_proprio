@@ -14,11 +14,11 @@ from pydantic import BaseModel, Field
 from typing import Literal
 
 from app.database.db import Base, SessionLocal, engine
-from app.database.models import Addon, LibraryItem, MetadataItem, Preference
+from app.database.models import Addon, LibraryItem, LinkCheck, MetadataItem, Preference
 from app.jellyfin.client import authenticate_user, refresh_library
 from app.library.dynamic import dynamic_signature, dynamic_strm_url, verify_dynamic_signature
 from app.library.service import scan_movie, scan_series, series_folder_name, title_folder_name
-from app.config import BESTCINE_MANIFEST_URL, COOKIE_SECURE, FENIXFLIX_MANIFEST_URL, FROST_MANIFEST_URL, MAX_UPLOAD_BYTES, MEDIA_ROOT
+from app.config import BESTCINE_MANIFEST_URL, COOKIE_SECURE, FENIXFLIX_MANIFEST_URL, FROST_MANIFEST_URL, LINK_CHECK_INTERVAL_SECONDS, MAX_UPLOAD_BYTES, MEDIA_ROOT
 from app.metadata.cinemeta import details as get_metadata_details
 from app.metadata.cinemeta import search as search_metadata
 from app.stremio.client import read_manifest as read_addon_manifest
@@ -35,9 +35,9 @@ from app.security import (
     check_login_rate_limit,
     record_login_attempt,
     check_request_rate_limit,
-    session_user,
 )
 from app.jobs.manager import can_access_job, create_job, get_job, mark_interrupted_jobs, start_task, update_job
+from app.jobs.link_checker import check_library_item, periodic_link_check
 from app.proxy.service import has_proxy_headers, proxy_stream
 
 
@@ -59,7 +59,15 @@ async def lifespan(_: FastAPI):
         if session.get(Preference, 1) is None:
             session.add(Preference(id=1))
         session.commit()
-    yield
+    link_check_task = asyncio.create_task(periodic_link_check(LINK_CHECK_INTERVAL_SECONDS))
+    try:
+        yield
+    finally:
+        link_check_task.cancel()
+        try:
+            await link_check_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Media Library Manager", version="0.1.0", lifespan=lifespan)
@@ -201,9 +209,40 @@ async def title_details(
         session.commit()
     if media_type == "movie":
         details["library_status"] = scan_movie(MEDIA_ROOT, details["title"], details.get("year"))
+        details["library_status"]["link_check"] = _get_link_check(f"movie:{imdb_id}")
     else:
         details["library_status"] = scan_series(MEDIA_ROOT, details["title"], details.get("year"), details.get("year_end"), details.get("episodes", []))
+        checks = _get_link_checks(imdb_id)
+        for episode in details["library_status"]["episodes"]:
+            episode["link_check"] = checks.get(f"series:{imdb_id}:{episode['season_number']}:{episode['episode_number']}")
     return details
+
+
+def _get_link_checks(imdb_id: str) -> dict[str, dict]:
+    with SessionLocal() as session:
+        rows = session.query(LinkCheck).join(LibraryItem, LinkCheck.library_item_id == LibraryItem.id).filter(LibraryItem.imdb_id == imdb_id).all()
+        return {row.library_item_id: {"status": row.status, "checked_at": row.checked_at, "provider": row.provider,
+                                      "quality": row.quality, "http_status": row.http_status, "message": row.message}
+                for row in rows}
+
+
+def _get_link_check(item_id: str) -> dict | None:
+    with SessionLocal() as session:
+        row = session.get(LinkCheck, item_id)
+        if row is None:
+            return None
+        return {"status": row.status, "checked_at": row.checked_at, "provider": row.provider,
+                "quality": row.quality, "http_status": row.http_status, "message": row.message}
+
+
+@app.get("/api/library/checks/{media_type}/{imdb_id}")
+async def library_checks(media_type: Literal["movie", "series"], imdb_id: str, _: None = Depends(require_session)) -> dict:
+    if not re.fullmatch(r"tt\d+", imdb_id):
+        raise HTTPException(status_code=422, detail="IMDb ID invalido.")
+    checks = _get_link_checks(imdb_id)
+    if media_type == "movie":
+        return {"movie": checks.get(f"movie:{imdb_id}")}
+    return {"episodes": {"{}:{}".format(*item_id.split(":")[-2:]): check for item_id, check in checks.items() if item_id.startswith(f"series:{imdb_id}:")}}
 
 
 @app.get("/api/addons")
@@ -378,6 +417,7 @@ def _write_strm(relative_path: Path, url: str, item_id: str, media_type: str, im
     with SessionLocal() as session:
         session.add(LibraryItem(id=item_id, media_type=media_type, imdb_id=imdb_id, title=title, path=str(target), stream_url=url))
         session.commit()
+    start_task(check_library_item(item_id))
     return {"added": True, "existing": False, "path": str(target)}
 
 

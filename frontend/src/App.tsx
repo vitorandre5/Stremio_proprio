@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 
 type MediaType = "movie" | "series";
 type SearchFilter = "all" | MediaType;
+type LinkCheckState = { status: "pending" | "checking" | "available" | "unavailable" | "no_source" | "invalid" | "missing_file" | "error"; checked_at?: string | null; provider?: string | null; quality?: string | null; http_status?: number | null; message?: string };
 
 type SearchResult = {
   id: string;
@@ -22,7 +23,7 @@ type TitleDetails = SearchResult & {
   episode_count?: number;
   seasons?: { season_number: number; name: string; episode_count: number; air_date: string | null }[];
   episodes: { season_number: number; episode_number: number; title: string; overview: string; released: string | null }[];
-  library_status?: { status?: "media" | "strm" | "missing"; path?: string | null; episodes?: { season_number: number; episode_number: number; status: "media" | "strm" | "missing"; path: string | null }[] };
+  library_status?: { status?: "media" | "strm" | "missing"; path?: string | null; link_check?: LinkCheckState | null; episodes?: { season_number: number; episode_number: number; status: "media" | "strm" | "missing"; path: string | null; link_check?: LinkCheckState | null }[] };
 };
 
 type StreamOption = { name: string; title: string; provider: string; quality: string | null; language: "dubbed" | "subtitled" | "portuguese_unspecified" | "unknown"; url: string };
@@ -41,6 +42,20 @@ function manifestPrefixes(manifest: AddonItem["manifest"]) {
 
 function streamLanguageLabel(language: StreamOption["language"]) {
   return ({ dubbed: "Dublado", subtitled: "Legendado", portuguese_unspecified: "Português · tipo não informado", unknown: "Idioma não informado" })[language];
+}
+
+function linkCheckLabel(item: { status: "media" | "strm" | "missing"; link_check?: LinkCheckState | null }) {
+  if (item.status === "missing") return { label: "Não adicionado", state: "missing" };
+  if (item.status === "media") return { label: "Vídeo local", state: "available" };
+  const check = item.link_check;
+  if (!check) return { label: "STRM · aguardando verificação", state: "pending" };
+  const labels: Record<LinkCheckState["status"], string> = {
+    pending: "STRM · aguardando verificação", checking: "STRM · verificando",
+    available: `Disponível${check.quality ? ` · ${check.quality}` : ""}`,
+    unavailable: `Stream inválido${check.http_status ? ` · HTTP ${check.http_status}` : ""}`, error: "Falha na verificação",
+    no_source: "Sem fonte ativa", invalid: "STRM inválido", missing_file: "Arquivo STRM ausente",
+  };
+  return { label: labels[check.status], state: check.status };
 }
 
 const FILTERS: { value: SearchFilter; label: string }[] = [
@@ -92,6 +107,28 @@ export default function App() {
   }, []);
 
   useEffect(() => () => jobEvents.current?.close(), []);
+
+  useEffect(() => {
+    if (!details?.imdb_id) return;
+    let active = true;
+    const updateChecks = async () => {
+      try {
+        const response = await fetch(`/api/library/checks/${details.media_type}/${details.imdb_id}`);
+        if (!response.ok || !active) return;
+        const data = await response.json();
+        setDetails((current) => {
+          if (!current || current.imdb_id !== details.imdb_id) return current;
+          const library = current.library_status || {};
+          if (current.media_type === "movie") return { ...current, library_status: { ...library, link_check: data.movie || null } };
+          return { ...current, library_status: { ...library, episodes: (library.episodes || []).map((item) => ({
+            ...item, link_check: data.episodes?.[`${item.season_number}:${item.episode_number}`] || null,
+          })) } };
+        });
+      } catch { /* o status mais recente continua visível até a próxima consulta */ }
+    };
+    const timer = window.setInterval(() => void updateChecks(), 30_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [details?.imdb_id, details?.media_type]);
 
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -509,7 +546,7 @@ export default function App() {
                 <div className="detail-body">
                   {jobState && <div className={`message job-progress ${jobState.status === "failed" ? "error-message" : ""}`} aria-live="polite"><div><strong>{jobState.message}</strong><span>{jobState.total ? `${jobState.completed.toLocaleString()} / ${jobState.total.toLocaleString()}` : jobState.status}</span></div>{jobState.total > 0 && <progress max={jobState.total} value={Math.min(jobState.completed, jobState.total)} />}</div>}
                   <div className="detail-block"><h3>Sinopse</h3><p>{details.overview || "Sinopse indisponível para este título."}</p></div>
-                  {details.media_type === "movie" && <div className="detail-block movie-add-block"><h3>Biblioteca</h3><p>{details.library_status?.status === "media" ? "Arquivo de video encontrado." : details.library_status?.status === "strm" ? "Arquivo STRM encontrado." : "Ainda nao adicionado."}</p>{details.library_status?.path && <small>{details.library_status.path}</small>}<button className="episode-action" type="button" onClick={() => void loadMovieStreams()}>Consultar addons</button>{isAdmin && <label className="episode-action upload-action">Importar arquivo local<input type="file" accept=".mp4,.mkv,.webm,video/mp4,video/x-matroska,video/webm" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file && details.imdb_id) void startImport(`/api/jobs/import/movie/${details.imdb_id}`, file); }} /></label>}{streamState.key === "movie" && <div className="stream-results">{streamState.loading && <p>Consultando addons...</p>}{streamState.error && <p className="error-message">{streamState.error}</p>}{streamState.saved && <p className="success-message">{streamState.saved}</p>}{streamState.streams.map((stream) => <div className="stream-option" key={`${stream.provider}-${stream.url}`}><div><strong>{stream.provider} · {streamLanguageLabel(stream.language)}</strong><span>{stream.quality || stream.name}</span><small>{stream.title}</small></div>{isAdmin && <button type="button" onClick={() => void addMovieStream(stream)}>Adicionar</button>}</div>)}</div>}</div>}
+                  {details.media_type === "movie" && <div className="detail-block movie-add-block"><h3>Biblioteca</h3><p className={`library-state ${linkCheckLabel({ status: details.library_status?.status || "missing", link_check: details.library_status?.link_check }).state}`}>{linkCheckLabel({ status: details.library_status?.status || "missing", link_check: details.library_status?.link_check }).label}</p>{details.library_status?.link_check?.checked_at && <small>Verificado em {new Date(details.library_status.link_check.checked_at).toLocaleString()}</small>}{details.library_status?.path && <small>{details.library_status.path}</small>}<button className="episode-action" type="button" onClick={() => void loadMovieStreams()}>Consultar addons</button>{isAdmin && <label className="episode-action upload-action">Importar arquivo local<input type="file" accept=".mp4,.mkv,.webm,video/mp4,video/x-matroska,video/webm" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file && details.imdb_id) void startImport(`/api/jobs/import/movie/${details.imdb_id}`, file); }} /></label>}{streamState.key === "movie" && <div className="stream-results">{streamState.loading && <p>Consultando addons...</p>}{streamState.error && <p className="error-message">{streamState.error}</p>}{streamState.saved && <p className="success-message">{streamState.saved}</p>}{streamState.streams.map((stream) => <div className="stream-option" key={`${stream.provider}-${stream.url}`}><div><strong>{stream.provider} · {streamLanguageLabel(stream.language)}</strong><span>{stream.quality || stream.name}</span><small>{stream.title}</small></div>{isAdmin && <button type="button" onClick={() => void addMovieStream(stream)}>Adicionar</button>}</div>)}</div>}</div>}
                   {details.media_type === "series" && details.seasons && (
                     <div className="detail-block season-summary">
                       <div><h3>Temporadas</h3><span>{details.season_count ?? details.seasons.length} temporadas · {details.episode_count ?? "?"} episódios</span></div>
@@ -527,7 +564,7 @@ export default function App() {
                                 {episodes.map((episode) => (
                                   <article className="episode-row" key={`${episode.season_number}-${episode.episode_number}`}>
                                     <span className="episode-number">S{String(episode.season_number).padStart(2, "0")}E{String(episode.episode_number).padStart(2, "0")}</span>
-                                    <div className="episode-copy"><strong>{episode.title}</strong><small className={`library-state ${details.library_status?.episodes?.find((item) => item.season_number === episode.season_number && item.episode_number === episode.episode_number)?.status || "missing"}`}>{details.library_status?.episodes?.find((item) => item.season_number === episode.season_number && item.episode_number === episode.episode_number)?.status === "media" ? "Video local" : details.library_status?.episodes?.find((item) => item.season_number === episode.season_number && item.episode_number === episode.episode_number)?.status === "strm" ? "STRM" : "Nao adicionado"}</small><p>{episode.overview || "Sinopse indisponível."}</p><button className="episode-action" type="button" onClick={() => loadEpisodeStreams(episode)}>Consultar addons</button>{isAdmin && <label className="episode-action upload-action">Importar arquivo local<input type="file" accept=".mp4,.mkv,.webm,video/mp4,video/x-matroska,video/webm" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file && details.imdb_id) void startImport(`/api/jobs/import/series/${details.imdb_id}/${episode.season_number}/${episode.episode_number}`, file); }} /></label>}</div>
+                                    <div className="episode-copy"><strong>{episode.title}</strong>{(() => { const status = details.library_status?.episodes?.find((item) => item.season_number === episode.season_number && item.episode_number === episode.episode_number); const check = linkCheckLabel({ status: status?.status || "missing", link_check: status?.link_check }); return <small className={`library-state ${check.state}`} title={status?.link_check?.message || undefined}>{check.label}{status?.link_check?.checked_at ? ` · ${new Date(status.link_check.checked_at).toLocaleString()}` : ""}</small>; })()}<p>{episode.overview || "Sinopse indisponível."}</p><button className="episode-action" type="button" onClick={() => loadEpisodeStreams(episode)}>Consultar addons</button>{isAdmin && <label className="episode-action upload-action">Importar arquivo local<input type="file" accept=".mp4,.mkv,.webm,video/mp4,video/x-matroska,video/webm" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file && details.imdb_id) void startImport(`/api/jobs/import/series/${details.imdb_id}/${episode.season_number}/${episode.episode_number}`, file); }} /></label>}</div>
                                   </article>
                                 ))}
                                 {streamState.key.startsWith(`${season.season_number}:`) && <div className="stream-results">

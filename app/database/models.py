@@ -38,6 +38,18 @@ class LibraryItem(Base):
     stream_url: Mapped[str] = mapped_column(Text)
 
 
+class LinkCheck(Base):
+    __tablename__ = "link_checks"
+
+    library_item_id: Mapped[str] = mapped_column(String(120), primary_key=True)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    checked_at: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    provider: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    quality: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    message: Mapped[str] = mapped_column(String(240), default="Aguardando primeira verificacao.")
+
+
 class Preference(Base):
     __tablename__ = "preferences"
 

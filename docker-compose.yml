@@ -17,6 +17,8 @@ services:
       FENIXFLIX_MANIFEST_URL: ${FENIXFLIX_MANIFEST_URL:-https://fenixflix.fenixhub.online/qualities=4k,1080p,720p,sd%7Caudio=dublado,legendado%7Ccatalogs=populares_movie,populares_series,recentes_movie,recentes_series/manifest.json}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://media.melhornegocio.shop}
       MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-21474836480}
+      LINK_CHECK_INTERVAL_SECONDS: ${LINK_CHECK_INTERVAL_SECONDS:-300}
+      LINK_CHECK_TIMEOUT_SECONDS: ${LINK_CHECK_TIMEOUT_SECONDS:-15}
       MEDIA_ROOT: ${MEDIA_ROOT:-/media/stream media}
     volumes:
       - app_data:/data

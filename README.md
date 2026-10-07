@@ -17,6 +17,7 @@ Configure no Coolify `JELLYFIN_URL`, `JELLYFIN_API_KEY` e `SESSION_SECRET` (valo
 - Cadastro de Manifest URLs Stremio: leitura e validacao do manifest, resources, types e idPrefixes opcionais, seguida de chamadas aos endpoints JSON anunciados. O sistema nao faz scraping HTML nem tenta contornar protecoes externas.
 - Consulta dos addons ativos com prioridade de idioma dublado, depois legendado; preferencias de qualidade e provider controlam a ordem subsequente. FrostStream vem primeiro na consulta; os outros addons ativos funcionam como fallback.
 - Criacao de `.strm` dinamicos assinados. O Jellyfin acessa `/stream/...`, o backend consulta os addons novamente e redireciona para uma URL HTTPS direta. O proxy so e usado quando `behaviorHints.proxyHeaders` foi explicitamente fornecido pelo addon; headers `Range` sao encaminhados.
+- Verificacao automatica dos `.strm` dinamicos a cada 5 minutos e logo apos a criacao. O backend consulta os addons de novo, testa ate cinco URLs com uma requisicao `Range: bytes=0-0` e registra estado, HTTP e horario; nao persiste URL temporaria. A tela mostra disponivel, stream invalido, sem fonte, arquivo ausente ou erro de verificacao.
 - Importacao de `.mp4`, `.mkv` e `.webm` com limite configuravel (20 GB por padrao), progresso de upload e organizacao no formato de pastas Jellyfin.
 - Jobs persistentes com progresso por SSE para adicionar temporada/serie, sincronizar metadata e importar arquivos. A sincronizacao detecta arquivos existentes e nunca os substitui.
 - Verificacao de arquivos locais e `.strm`, protecao SSRF para hosts de addons/streams, validacao CSRF, cookies de sessao seguros e limite de requisicoes.
@@ -27,6 +28,7 @@ Configure no Coolify `JELLYFIN_URL`, `JELLYFIN_API_KEY` e `SESSION_SECRET` (valo
 - `GET /health`
 - `GET /api/search?query=Mr.%20Robot&media_type=series` (requer sessao)
 - `GET /api/title/series/tt4158110` (requer sessao; metadata e estado local)
+- `GET /api/library/checks/series/tt4158110` (requer sessao; ultimo estado das verificacoes dos links)
 - `GET /api/streams/series/tt4158110/1/1` (requer sessao)
 - `POST /api/library/add/series/tt4158110/1/1` (administrador + CSRF)
 - `POST /api/library/add/series/tt4158110/season/1` (job para temporada)
@@ -37,7 +39,7 @@ Configure no Coolify `JELLYFIN_URL`, `JELLYFIN_API_KEY` e `SESSION_SECRET` (valo
 
 ## Validacao feita em 2026-10-07
 
-Frontend TypeScript, imagem Docker e Compose foram validados localmente; 21 testes passaram em container Python 3.12. Os testes cobrem autenticacao Jellyfin, cliente de addons, links dinamicos, progresso de jobs, sincronizacao sem sobrescrever arquivos e importacao organizada.
+Frontend TypeScript, imagem Docker e Compose foram validados localmente; os testes cobrem autenticacao Jellyfin, cliente de addons, links dinamicos, verificacao curta de streams, progresso de jobs, sincronizacao sem sobrescrever arquivos e importacao organizada.
 
 No site publicado, a busca por `Mr. Robot` retornou a serie de 2015 (`tt4158110`), quatro temporadas, 45 episodios, sinopse e elenco. A consulta ao S01E01 retornou uma fonte direta FenixFlix 1080p dublada. FrostStream e BestCine nao forneceram stream utilizavel no teste mais recente; o fallback FenixFlix funcionou. O PopPlay informado pelo usuario permanece indisponivel por falha de DNS, portanto nao foi adicionado como fonte funcional.
 
