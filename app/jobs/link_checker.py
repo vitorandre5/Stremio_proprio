@@ -201,10 +201,13 @@ async def check_all_library_items() -> None:
 
 
 async def periodic_link_check(interval_seconds: int) -> None:
+    interval = max(1, interval_seconds)
     while True:
-        await asyncio.sleep(interval_seconds)
+        started = asyncio.get_running_loop().time()
         try:
             await check_all_library_items()
         except Exception:
             # A falha de uma rodada nao deve encerrar as verificacoes seguintes.
-            continue
+            pass
+        elapsed = asyncio.get_running_loop().time() - started
+        await asyncio.sleep(max(0, interval - elapsed))
