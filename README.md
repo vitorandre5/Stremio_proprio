@@ -6,7 +6,7 @@ Aplicação FastAPI + React para pesquisar metadata, consultar addons Stremio e 
 
 Use o Docker Compose do repositório e publique a porta interna `8000`. Mantenha o volume persistente `app_data` e configure no Coolify `JELLYFIN_URL`, `JELLYFIN_API_KEY` e `SESSION_SECRET` (segredo aleatório com pelo menos 32 caracteres). `COOKIE_SECURE=true` deve permanecer ligado atrás de HTTPS. O healthcheck é `GET /health`.
 
-O Compose monta `/home/ubuntu/jellyfin/tvshows` em `/media`; os `.strm` são organizados em `/media/stream media`. O Compose não fixa arquitetura: o Coolify constrói para o host de destino.
+O Compose monta `/home/ubuntu/jellyfin/tvshows` em `/media`; os `.strm` são organizados em `/media/stream media`. A aplicação atende HTTP na porta interna `8000`. Para Cloudflare Tunnel, o host publica essa porta apenas em `127.0.0.1:8001`; configure a rota Tunnel para `http://localhost:8001`. O Compose não fixa arquitetura: o Coolify constrói para o host de destino.
 
 ## Implementado
 

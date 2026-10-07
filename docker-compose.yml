@@ -3,6 +3,9 @@ services:
     build: .
     expose:
       - "8000"
+    # Origem HTTP local para o Cloudflare Tunnel, sem publicar na interface externa.
+    ports:
+      - "127.0.0.1:8001:8000"
     environment:
       DATABASE_URL: ${DATABASE_URL:-sqlite:////data/media_library.sqlite3}
       JELLYFIN_URL: ${JELLYFIN_URL:-}
