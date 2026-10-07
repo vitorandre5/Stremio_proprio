@@ -124,6 +124,18 @@ def _replace_managed_strm(path: Path, previous_url: str, new_url: str) -> bool:
         return False
 
 
+def _store_direct_url(item_id: str, path: Path, previous_url: str, new_url: str) -> bool:
+    with SessionLocal() as session:
+        item = session.get(LibraryItem, item_id)
+        if item is None or item.stream_url != previous_url:
+            return False
+        if not _replace_managed_strm(path, previous_url, new_url):
+            return False
+        item.stream_url = new_url
+        session.commit()
+    return True
+
+
 async def _probe_stream(stream: dict) -> tuple[bool, int | None]:
     url = stream["url"]
     hints = stream.get("behavior_hints") or {}
@@ -228,16 +240,9 @@ async def _check_library_item(item_id: str) -> None:
     for stream in streams[:5]:
         usable, http_status = await _probe_stream(stream)
         if usable:
-            if not _replace_managed_strm(media_path, item_snapshot["stream_url"], stream["url"]):
+            if not _store_direct_url(item_id, media_path, item_snapshot["stream_url"], stream["url"]):
                 _save_check(item_id, "invalid", "O STRM foi alterado durante a verificacao e foi preservado.")
                 return
-            with SessionLocal() as session:
-                item = session.get(LibraryItem, item_id)
-                if item is None or item.stream_url != item_snapshot["stream_url"]:
-                    _save_check(item_id, "invalid", "O registro mudou durante a verificacao; nova tentativa agendada.")
-                    return
-                item.stream_url = stream["url"]
-                session.commit()
             message = (
                 "URL direta do addon atualizada e respondendo."
                 if item_snapshot["legacy"] or stream["url"] != item_snapshot["stream_url"]
@@ -246,6 +251,10 @@ async def _check_library_item(item_id: str) -> None:
             _save_check(item_id, "available", message, stream, http_status)
             return
         last_status = http_status or last_status
+    if item_snapshot["legacy"]:
+        if not _store_direct_url(item_id, media_path, item_snapshot["stream_url"], streams[0]["url"]):
+            _save_check(item_id, "invalid", "O STRM foi alterado durante a verificacao e foi preservado.")
+            return
     _save_check(item_id, "unavailable", "Os streams retornados falharam na requisicao de teste.", streams[0], last_status)
 
 async def check_library_item(item_id: str) -> None:

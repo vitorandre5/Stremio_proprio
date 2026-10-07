@@ -110,10 +110,13 @@ class LinkCheckerTests(unittest.TestCase):
             with session_factory() as session:
                 session.get(LibraryItem, "series:tt4158110:1:1").stream_url = legacy_url
                 session.commit()
-            asyncio.run(link_checker.check_library_item("series:tt4158110:1:1"))
+            with patch("app.jobs.link_checker._probe_stream", new=AsyncMock(return_value=(False, 408))):
+                asyncio.run(link_checker.check_library_item("series:tt4158110:1:1"))
             with session_factory() as session:
                 item = session.get(LibraryItem, "series:tt4158110:1:1")
+                check = session.get(LinkCheck, "series:tt4158110:1:1")
                 self.assertEqual(item.stream_url, "https://cdn.example.test/video")
+                self.assertEqual(check.status, "unavailable")
             self.assertEqual(path.read_text(encoding="utf-8").strip(), "https://cdn.example.test/video")
         engine.dispose()
 
