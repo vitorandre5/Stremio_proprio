@@ -1,8 +1,10 @@
 import asyncio
 from datetime import datetime, timezone
 import logging
+import os
 from pathlib import Path
 import re
+import tempfile
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 import httpx
@@ -79,6 +81,49 @@ def _stored_target(item: LibraryItem) -> tuple[str, str, int | None, int | None,
     return media_type, imdb_id, season, number, provider, signature
 
 
+def _item_target(item: LibraryItem, preferred_provider: str = "") -> tuple[str, str, int | None, int | None, str] | None:
+    legacy = _stored_target(item)
+    if legacy is not None:
+        return legacy[:5]
+    if item.stream_url == "local":
+        return None
+    try:
+        validate_public_https_url(item.stream_url)
+    except Exception:
+        return None
+    movie = re.fullmatch(r"movie:(tt\d+)", item.id)
+    episode = re.fullmatch(r"series:(tt\d+):(\d{1,2}):(\d{1,3})", item.id)
+    if movie and item.media_type == "movie" and movie.group(1) == item.imdb_id:
+        return "movie", item.imdb_id, None, None, preferred_provider
+    if episode and item.media_type == "series" and episode.group(1) == item.imdb_id:
+        return "series", item.imdb_id, int(episode.group(2)), int(episode.group(3)), preferred_provider
+    return None
+
+
+def _replace_managed_strm(path: Path, previous_url: str, new_url: str) -> bool:
+    """Refresh only a manager-owned STRM whose current contents still match the DB."""
+    if previous_url == new_url:
+        return True
+    try:
+        if path.read_text(encoding="utf-8").strip() != previous_url:
+            return False
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="\n", dir=path.parent,
+                prefix=f".{path.name}.", suffix=".tmp", delete=False,
+            ) as temporary_file:
+                temporary_file.write(new_url + "\n")
+                temporary_path = Path(temporary_file.name)
+            os.replace(temporary_path, path)
+            return True
+        finally:
+            if temporary_path is not None and temporary_path.exists():
+                temporary_path.unlink()
+    except OSError:
+        return False
+
+
 async def _probe_stream(stream: dict) -> tuple[bool, int | None]:
     url = stream["url"]
     hints = stream.get("behavior_hints") or {}
@@ -141,9 +186,12 @@ async def _check_library_item(item_id: str) -> None:
         item = session.get(LibraryItem, item_id)
         if item is None:
             return
-        target = _stored_target(item)
+        previous_check = session.get(LinkCheck, item_id)
+        previous_provider = previous_check.provider_id if previous_check else ""
+        target = _item_target(item, previous_provider or "")
         item_snapshot = {"id": item.id, "path": item.path, "stream_url": item.stream_url,
-                         "media_type": item.media_type, "imdb_id": item.imdb_id}
+                         "media_type": item.media_type, "imdb_id": item.imdb_id,
+                         "legacy": _stored_target(item) is not None}
         addons = session.query(Addon).filter(Addon.enabled.is_(True)).order_by(Addon.id).all()
         addon_config = [{"id": addon.id, "name": addon.name, "manifest_url": addon.manifest_url} for addon in addons]
         preference = session.get(Preference, 1)
@@ -151,7 +199,7 @@ async def _check_library_item(item_id: str) -> None:
 
     _save_check(item_id, "checking", "Consultando addons e verificando o stream.")
     if target is None:
-        _save_check(item_id, "invalid", "O STRM armazenado não é um link dinâmico válido da aplicação.")
+        _save_check(item_id, "invalid", "O STRM nao contem uma URL HTTPS publica valida do addon.")
         return
     root = Path(MEDIA_ROOT).resolve()
     media_path = Path(item_snapshot["path"]).resolve()
@@ -160,13 +208,13 @@ async def _check_library_item(item_id: str) -> None:
         return
     try:
         if media_path.read_text(encoding="utf-8").strip() != item_snapshot["stream_url"]:
-            _save_check(item_id, "invalid", "O conteúdo do .strm diverge do link dinâmico registrado.")
+            _save_check(item_id, "invalid", "O conteudo do STRM foi alterado fora do gerenciador.")
             return
     except (OSError, UnicodeError):
         _save_check(item_id, "invalid", "Não foi possível ler o arquivo .strm.")
         return
 
-    media_type, imdb_id, season, episode, preferred_provider, _ = target
+    media_type, imdb_id, season, episode, preferred_provider = target
     video_id = imdb_id if media_type == "movie" else f"{imdb_id}:{season}:{episode}"
     addon_config.sort(key=lambda addon: (0 if addon["id"] == preferred_provider else 1, addon["name"].casefold()))
     result = await find_direct_streams(addon_config, media_type, video_id)
@@ -180,11 +228,25 @@ async def _check_library_item(item_id: str) -> None:
     for stream in streams[:5]:
         usable, http_status = await _probe_stream(stream)
         if usable:
-            _save_check(item_id, "available", "Stream respondeu a uma requisição de teste.", stream, http_status)
+            if not _replace_managed_strm(media_path, item_snapshot["stream_url"], stream["url"]):
+                _save_check(item_id, "invalid", "O STRM foi alterado durante a verificacao e foi preservado.")
+                return
+            with SessionLocal() as session:
+                item = session.get(LibraryItem, item_id)
+                if item is None or item.stream_url != item_snapshot["stream_url"]:
+                    _save_check(item_id, "invalid", "O registro mudou durante a verificacao; nova tentativa agendada.")
+                    return
+                item.stream_url = stream["url"]
+                session.commit()
+            message = (
+                "URL direta do addon atualizada e respondendo."
+                if item_snapshot["legacy"] or stream["url"] != item_snapshot["stream_url"]
+                else "Stream respondeu a uma requisicao de teste."
+            )
+            _save_check(item_id, "available", message, stream, http_status)
             return
         last_status = http_status or last_status
-    _save_check(item_id, "unavailable", "Os streams retornados falharam na requisição de teste.", streams[0], last_status)
-
+    _save_check(item_id, "unavailable", "Os streams retornados falharam na requisicao de teste.", streams[0], last_status)
 
 async def check_library_item(item_id: str) -> None:
     async with _CHECK_SEMAPHORE:

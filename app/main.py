@@ -456,8 +456,7 @@ async def add_movie(
         raise HTTPException(status_code=422, detail="A opção selecionada expirou. Consulte os streams novamente.")
     title = name
     rel = Path(name) / f"{name}.strm"
-    dynamic_url = dynamic_strm_url("movie", imdb_id, stream["provider_id"])
-    result = _write_strm(rel, dynamic_url, f"movie:{imdb_id}", "movie", imdb_id, title)
+    result = _write_strm(rel, stream["url"], f"movie:{imdb_id}", "movie", imdb_id, title)
     if result["added"]:
         try:
             await refresh_library()
@@ -500,8 +499,7 @@ async def add_episode(
     filename = _safe_name(f"{series_name} - {code}") + ".strm"
     rel = Path(_safe_name(series_name)) / season_name / filename
     item_id = f"series:{imdb_id}:{season}:{episode}"
-    dynamic_url = dynamic_strm_url("series", imdb_id, stream["provider_id"], season, episode)
-    result = _write_strm(rel, dynamic_url, item_id, "series", imdb_id, selected["title"])
+    result = _write_strm(rel, stream["url"], item_id, "series", imdb_id, selected["title"])
     if result["added"]:
         try:
             await refresh_library()
@@ -563,10 +561,9 @@ async def _run_episode_job(job_id: str, details: dict, episodes: list[dict], kin
                     unavailable += 1
                     message = f"S{season:02d}E{number:02d}: nenhuma fonte direta disponivel."
                 else:
-                    dynamic_url = dynamic_strm_url("series", details["imdb_id"], streams[0]["provider_id"], season, number)
                     outcome = _write_strm(
                         _episode_strm_path(details, season, number),
-                        dynamic_url,
+                        streams[0]["url"],
                         item_id,
                         "series",
                         details["imdb_id"],

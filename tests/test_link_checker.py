@@ -69,7 +69,7 @@ class LinkCheckerTests(unittest.TestCase):
         self.assertEqual(status, 206)
         self.assertEqual(sent_headers[0][2], {"Range": "bytes=0-0"})
 
-    def test_created_dynamic_strm_is_persisted_and_checked(self):
+    def test_created_strm_uses_addon_url_and_checker_refreshes_that_url(self):
         engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
         Base.metadata.create_all(engine)
         session_factory = sessionmaker(bind=engine, expire_on_commit=False)
@@ -78,6 +78,7 @@ class LinkCheckerTests(unittest.TestCase):
                 patch("app.library.dynamic.SESSION_SECRET", os.environ["SESSION_SECRET"]), \
                 patch("app.jobs.link_checker.PUBLIC_BASE_URL", "https://media.example.test"), \
                 patch("app.jobs.link_checker.MEDIA_ROOT", directory), \
+                patch("app.jobs.link_checker.validate_public_https_url", side_effect=lambda url: url), \
                 patch("app.jobs.link_checker.SessionLocal", session_factory), \
                 patch("app.main.SessionLocal", session_factory), \
                 patch("app.main.MEDIA_ROOT", directory), \
@@ -87,21 +88,33 @@ class LinkCheckerTests(unittest.TestCase):
                     "language": "dubbed", "url": "https://cdn.example.test/video", "behavior_hints": {},
                 }], "addon_errors": []})), \
                 patch("app.jobs.link_checker._probe_stream", new=AsyncMock(return_value=(True, 206))):
-            url = dynamic_strm_url("series", "tt4158110", "com.fenixflix", 1, 1)
+            addon_url = "https://froststream.example.test/series/addon-stream-id"
             created = _write_strm(
                 Path("Mr Robot (2015)") / "Season 01" / "Mr Robot - S01E01.strm",
-                url, "series:tt4158110:1:1", "series", "tt4158110", "eps1.0_hellofriend.mov",
+                addon_url, "series:tt4158110:1:1", "series", "tt4158110", "eps1.0_hellofriend.mov",
             )
             self.assertTrue(created["added"])
             path = Path(created["path"])
-            self.assertEqual(path.read_text(encoding="utf-8").strip(), url)
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), addon_url)
             asyncio.run(link_checker.check_library_item("series:tt4158110:1:1"))
             with session_factory() as session:
                 check = session.get(LinkCheck, "series:tt4158110:1:1")
                 item = session.get(LibraryItem, "series:tt4158110:1:1")
                 self.assertEqual(check.status, "available")
                 self.assertEqual(check.http_status, 206)
-                self.assertEqual(item.stream_url, url)
+                self.assertEqual(item.stream_url, "https://cdn.example.test/video")
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), "https://cdn.example.test/video")
+
+            legacy_url = dynamic_strm_url("series", "tt4158110", "com.fenixflix", 1, 1)
+            path.write_text(legacy_url + "\n", encoding="utf-8")
+            with session_factory() as session:
+                session.get(LibraryItem, "series:tt4158110:1:1").stream_url = legacy_url
+                session.commit()
+            asyncio.run(link_checker.check_library_item("series:tt4158110:1:1"))
+            with session_factory() as session:
+                item = session.get(LibraryItem, "series:tt4158110:1:1")
+                self.assertEqual(item.stream_url, "https://cdn.example.test/video")
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), "https://cdn.example.test/video")
         engine.dispose()
 
 

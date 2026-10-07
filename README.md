@@ -16,8 +16,8 @@ Configure no Coolify `JELLYFIN_URL`, `JELLYFIN_API_KEY` e `SESSION_SECRET` (valo
 - Login com as credenciais do Jellyfin. O token de autenticacao nao e persistido. Apenas administradores podem mudar addons, preferencias ou arquivos da biblioteca.
 - Cadastro de Manifest URLs Stremio: leitura e validacao do manifest, resources, types e idPrefixes opcionais, seguida de chamadas aos endpoints JSON anunciados. O sistema nao faz scraping HTML nem tenta contornar protecoes externas.
 - Consulta dos addons ativos com prioridade de idioma dublado, depois legendado; preferencias de qualidade e provider controlam a ordem subsequente. FrostStream vem primeiro na consulta; os outros addons ativos funcionam como fallback.
-- Criacao de `.strm` dinamicos assinados. O Jellyfin acessa `/stream/...`, o backend consulta os addons novamente e redireciona para uma URL HTTPS direta. O proxy so e usado quando `behaviorHints.proxyHeaders` foi explicitamente fornecido pelo addon; headers `Range` sao encaminhados.
-- Verificacao automatica dos `.strm` dinamicos a cada 5 minutos e logo apos a criacao. O backend consulta os addons de novo, testa ate cinco URLs com uma requisicao `Range: bytes=0-0` e registra estado, HTTP, horario e provider funcional; nao persiste URL temporaria. Ao reproduzir, o resolvedor prioriza o provider que passou na ultima verificacao e consulta novamente esse addon para obter um link novo. A tela mostra disponivel, stream invalido, sem fonte, arquivo ausente ou erro de verificacao.
+- Criacao de `.strm` com a URL HTTPS direta devolvida no campo `url` pelo addon. O arquivo nao recebe uma URL do dominio do Media Library Manager. As rotas `/stream/...` continuam disponiveis para resolucao dinamica, e o proxy so usa `behaviorHints.proxyHeaders` que o proprio addon forneceu.
+- Verificacao automatica a cada 5 minutos e logo apos a criacao. O backend consulta os addons de novo, testa ate cinco URLs com uma requisicao `Range: bytes=0-0` e registra estado, HTTP, horario e provider funcional. Quando encontra uma URL funcional, atualiza o `.strm` atomicamente com a URL exata devolvida pelo addon; se nao encontra, preserva a ultima URL. So atualiza arquivos gerenciados cujo conteudo ainda corresponde ao registro, preservando edicoes manuais. A verificacao migra com seguranca os `.strm` antigos que continham links internos assinados do app. A tela mostra disponivel, stream invalido, sem fonte, arquivo ausente ou erro de verificacao.
 - Importacao de `.mp4`, `.mkv` e `.webm` com limite configuravel (20 GB por padrao), progresso de upload e organizacao no formato de pastas Jellyfin.
 - Jobs persistentes com progresso por SSE para adicionar temporada/serie, sincronizar metadata e importar arquivos. A sincronizacao detecta arquivos existentes e nunca os substitui.
 - Verificacao de arquivos locais e `.strm`, protecao SSRF para hosts de addons/streams, validacao CSRF, cookies de sessao seguros e limite de requisicoes.
@@ -35,7 +35,7 @@ Configure no Coolify `JELLYFIN_URL`, `JELLYFIN_API_KEY` e `SESSION_SECRET` (valo
 - `POST /api/library/add/series/tt4158110` e `POST /api/library/sync/series/tt4158110` (jobs)
 - `POST /api/jobs/import/movie/{imdb_id}` / `POST /api/jobs/import/series/{imdb_id}/{season}/{episode}` e `PUT /api/jobs/{job_id}/upload` (administrador + CSRF)
 - `GET /api/jobs/{job_id}` e `GET /api/jobs/{job_id}/events` (sessao do dono ou administrador)
-- `GET /stream/movie/{imdb_id}` e `GET /stream/series/{imdb_id}/{season}/{episode}` (links assinados incluidos nos `.strm`)
+- `GET /stream/movie/{imdb_id}` e `GET /stream/series/{imdb_id}/{season}/{episode}` (rotas internas assinadas, mantidas para compatibilidade)
 
 ## Validacao feita em 2026-10-07
 
