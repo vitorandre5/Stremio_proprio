@@ -19,6 +19,7 @@ _MOVIE_PATH = re.compile(r"^/stream/movie/(tt\d+)$")
 _EPISODE_PATH = re.compile(r"^/stream/series/(tt\d+)/(\d{1,2})/(\d{1,3})$")
 _SENSITIVE_HEADERS = {"authorization", "cookie", "proxy-authorization"}
 logger = logging.getLogger("media_library_manager.link_checker")
+_CHECK_SEMAPHORE = asyncio.Semaphore(3)
 
 
 def _now() -> str:
@@ -185,23 +186,18 @@ async def _check_library_item(item_id: str) -> None:
 
 
 async def check_library_item(item_id: str) -> None:
-    try:
-        await _check_library_item(item_id)
-    except Exception:
-        logger.exception("Link verification failed for library item %s", item_id)
-        _save_check(item_id, "error", "Falha interna durante a verificacao; sera tentada novamente.")
+    async with _CHECK_SEMAPHORE:
+        try:
+            await _check_library_item(item_id)
+        except Exception:
+            logger.exception("Link verification failed for library item %s", item_id)
+            _save_check(item_id, "error", "Falha interna durante a verificacao; sera tentada novamente.")
 
 
 async def check_all_library_items() -> None:
     with SessionLocal() as session:
         item_ids = [item.id for item in session.query(LibraryItem.id).filter(LibraryItem.stream_url != "local").all()]
-    semaphore = asyncio.Semaphore(3)
-
-    async def bounded_check(item_id: str) -> None:
-        async with semaphore:
-            await check_library_item(item_id)
-
-    await asyncio.gather(*(bounded_check(item_id) for item_id in item_ids), return_exceptions=True)
+    await asyncio.gather(*(check_library_item(item_id) for item_id in item_ids), return_exceptions=True)
 
 
 async def periodic_link_check(interval_seconds: int) -> None:
