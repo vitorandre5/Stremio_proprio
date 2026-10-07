@@ -223,7 +223,7 @@ export default function App() {
       const response = await fetch(`/api/streams/movie/${details?.imdb_id}`);
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Falha ao consultar os addons.");
-      const addonErrors = (data.addon_errors || []).map((item: { provider: string; detail: string }) => `${item.provider}: ${item.detail}`).join(" ? ");
+      const addonErrors = (data.addon_errors || []).map((item: { provider: string; detail: string }) => `${item.provider}: ${item.detail}`).join(" · ");
       setStreamState({ key: "movie", loading: false, streams: data.streams, error: data.streams.length ? "" : addonErrors || "Nenhuma URL HTTPS direta foi retornada pelos addons.", saved: "" });
     } catch (cause) {
       setStreamState({ key: "movie", loading: false, streams: [], error: cause instanceof Error ? cause.message : "Falha ao consultar os addons.", saved: "" });
@@ -340,7 +340,7 @@ export default function App() {
   }
 
   if (authState === "checking") return <main className="auth-shell">Verificando sessão...</main>;
-  if (authState === "login") return <main className="auth-shell"><form className="auth-card" onSubmit={handleLogin}><span className="eyebrow">MEDIA LIBRARY MANAGER</span><h1>Acesse sua biblioteca</h1><label htmlFor="jellyfin-username">Usu?rio Jellyfin</label><input id="jellyfin-username" type="text" autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required /><label htmlFor="jellyfin-password">Senha Jellyfin</label><input id="jellyfin-password" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /><button type="submit">Entrar</button>{authError && <p className="error-message">{authError}</p>}</form></main>;
+  if (authState === "login") return <main className="auth-shell"><form className="auth-card" onSubmit={handleLogin}><span className="eyebrow">MEDIA LIBRARY MANAGER</span><h1>Acesse sua biblioteca</h1><label htmlFor="jellyfin-username">Usuário Jellyfin</label><input id="jellyfin-username" type="text" autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required /><label htmlFor="jellyfin-password">Senha Jellyfin</label><input id="jellyfin-password" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /><button type="submit">Entrar</button>{authError && <p className="error-message">{authError}</p>}</form></main>;
 
   async function handleSearch(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -513,7 +513,7 @@ export default function App() {
                   {details.media_type === "series" && details.seasons && (
                     <div className="detail-block season-summary">
                       <div><h3>Temporadas</h3><span>{details.season_count ?? details.seasons.length} temporadas · {details.episode_count ?? "?"} episódios</span></div>
-                      {isAdmin && <div className="series-actions"><button className="episode-action" type="button" onClick={() => void startJob(`/api/library/add/series/${details.imdb_id}`)}>Adicionar s?rie inteira</button><button className="episode-action" type="button" onClick={() => void startJob(`/api/library/sync/series/${details.imdb_id}`)}>Sincronizar s?rie</button></div>}
+                      {isAdmin && <div className="series-actions"><button className="episode-action" type="button" onClick={() => void startJob(`/api/library/add/series/${details.imdb_id}`)}>Adicionar série inteira</button><button className="episode-action" type="button" onClick={() => void startJob(`/api/library/sync/series/${details.imdb_id}`)}>Sincronizar série</button></div>}
                       <div className="season-list">
                         {details.seasons.map((season) => {
                           const episodes = details.episodes.filter((episode) => episode.season_number === season.season_number);
