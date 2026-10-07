@@ -1,4 +1,6 @@
 import json
+import re
+import unicodedata
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -57,6 +59,7 @@ def direct_urls(streams: list[dict]) -> list[dict]:
             "title": stream.get("title") or stream.get("name") or "Stream",
             "url": url,
             "quality": _quality(stream),
+            "language": _language(stream),
             "behavior_hints": hints,
         })
     return results
@@ -68,3 +71,16 @@ def _quality(stream: dict) -> str | None:
         if quality.lower() in text.lower():
             return quality
     return None
+
+
+def _language(stream: dict) -> str:
+    text = f"{stream.get('name', '')} {stream.get('title', '')}"
+    normalized = unicodedata.normalize("NFKD", text.casefold())
+    normalized = "".join(character for character in normalized if not unicodedata.combining(character))
+    if re.search(r"\b(dublado|dubbed|dub|dual[ -]?audio|audio[ -]?dub)\b", normalized):
+        return "dubbed"
+    if re.search(r"\b(legendado|subtitles?|subbed|legendas?)\b", normalized):
+        return "subtitled"
+    if re.search(r"\b(portugues|portuguese|pt[ -]?br)\b", normalized):
+        return "portuguese_unspecified"
+    return "unknown"

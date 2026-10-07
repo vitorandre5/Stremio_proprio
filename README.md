@@ -18,7 +18,7 @@ O Compose monta `/home/ubuntu/jellyfin/tvshows` em `/media`; os `.strm` são org
 - Criação de `.strm` sem sobrescrever arquivo existente, com gravação sob `/media/stream media`.
 - SQLite persistente e imagem Docker multi-stage.
 - Tela administrativa para cadastrar manifests, inspecionar recursos/tipos/prefixos e ativar/desativar addons.
-- Preferencias persistentes de provider e qualidade; consulta tenta o provider escolhido, depois FrostStream e os demais addons ativos.
+- Prefer?ncias persistentes de provider e qualidade; a ordena??o prioriza dublado globalmente, depois legendado, qualidade preferida e provider.
 - Status local por filme/episodio detecta `.strm` e videos `.mp4`, `.mkv`, `.webm`; arquivos existentes sao preservados ao adicionar.
 - Apos criar um novo `.strm`, solicita scan pelo endpoint Jellyfin `POST /Library/Refresh`; `JELLYFIN_API_KEY` fica somente no backend.
 
@@ -36,3 +36,16 @@ O Compose monta `/home/ubuntu/jellyfin/tvshows` em `/media`; os `.strm` são org
 ## Validação e limite atual
 
 O escritor `.strm` foi testado isoladamente. O host Oracle confirmou ACL de escrita para UID 10001; a consulta de streams FrostStream retornou HTTP 403 tambem no host. Nao se usa User-Agent arbitrario nem se contornam bloqueios. O deploy, teste real de login Jellyfin e teste real de scan ainda dependem das variaveis configuradas no Coolify.
+
+
+### Verifica??o dos addons (2026-10-07)
+
+Teste feito pelo protocolo JSON Stremio para Mr. Robot S01E01 (`tt4158110:1:1`). FrostStream (`2.2.8`), BestCine (`13.0.0`) e FenixFlix (`1.2.0`) tiveram manifest v?lido e responderam ao endpoint `/stream/series/{videoID}.json` via cliente PowerShell. Os testes retornaram 5, 20 e 1 resultado, respectivamente. Amostras JSON (URLs omitidas):
+
+```json
+{"streams":[{"name":"FrostStream 1080p","title":"... Legendado"}]}
+{"streams":[{"name":"BestCine 720p","title":"... Dublado"}]}
+{"streams":[{"name":"FenixFlix 1080p","title":"... Dublado"}]}
+```
+
+No teste feito dentro da imagem Docker local (mesmo cliente HTTP usado pelo backend), FrostStream e BestCine responderam HTTP 403; FenixFlix respondeu HTTP 2xx e entregou 1 stream marcado como dublado. Nenhum User-Agent foi mascarado nem houve tentativa de contornar bloqueios. Isso confirma que FenixFlix est? tecnicamente consult?vel neste ambiente; a reprodu??o pelo Jellyfin ainda depende de validar a URL e do acesso no servidor Coolify. PopPlay n?o chegou ao manifest: o hostname comunit?rio testado (`site--popplay--rg2h4m5nr425.code.run`) falhou na resolu??o DNS. Ele pode ser cadastrado em Configura??es quando houver um Manifest URL acess?vel.

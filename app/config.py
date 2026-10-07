@@ -12,6 +12,10 @@ FROST_MANIFEST_URL = os.getenv(
 BESTCINE_MANIFEST_URL = os.getenv(
     "BESTCINE_MANIFEST_URL", "https://bestcine.dpdns.org/manifest.json"
 ).strip()
+FENIXFLIX_MANIFEST_URL = os.getenv(
+    "FENIXFLIX_MANIFEST_URL",
+    "https://fenixflix.fenixhub.online/qualities=4k,1080p,720p,sd%7Caudio=dublado,legendado%7Ccatalogs=populares_movie,populares_series,recentes_movie,recentes_series/manifest.json",
+).strip()
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "/media/stream media").strip()
 JELLYFIN_URL = os.getenv("JELLYFIN_URL", "").strip().rstrip("/")
 JELLYFIN_API_KEY = os.getenv("JELLYFIN_API_KEY", "").strip()

@@ -13,11 +13,11 @@ from app.database.db import Base, SessionLocal, engine
 from app.database.models import Addon, LibraryItem, MetadataItem, Preference
 from app.jellyfin.client import authenticate_user, refresh_library
 from app.library.service import scan_movie, scan_series, series_folder_name, title_folder_name
-from app.config import BESTCINE_MANIFEST_URL, COOKIE_SECURE, FROST_MANIFEST_URL, MEDIA_ROOT
+from app.config import BESTCINE_MANIFEST_URL, COOKIE_SECURE, FENIXFLIX_MANIFEST_URL, FROST_MANIFEST_URL, MEDIA_ROOT
 from app.metadata.cinemeta import details as get_metadata_details
 from app.metadata.cinemeta import search as search_metadata
 from app.stremio.client import read_manifest as read_addon_manifest
-from app.stremio.resolver import find_direct_streams
+from app.stremio.resolver import find_direct_streams, sort_streams
 from app.security import (
     CSRF_COOKIE,
     SESSION_COOKIE,
@@ -39,6 +39,7 @@ async def lifespan(_: FastAPI):
         for addon_id, name, manifest_url in (
             ("com.froststream", "FrostStream", FROST_MANIFEST_URL),
             ("com.bestcine.multisource", "BestCine", BESTCINE_MANIFEST_URL),
+            ("com.fenixflix", "FenixFlix", FENIXFLIX_MANIFEST_URL),
         ):
             if session.get(Addon, addon_id) is None:
                 session.add(Addon(id=addon_id, name=name, manifest_url=manifest_url, enabled=True))
@@ -230,9 +231,7 @@ async def _streams_for(media_type: str, video_id: str) -> dict:
         addon["name"].casefold(),
     ))
     result = await find_direct_streams(config, media_type, video_id)
-    quality_order = [preferred_quality, "2160p", "1440p", "1080p", "720p", "480p"]
-    rank = {quality: index for index, quality in enumerate(dict.fromkeys(quality_order))}
-    result["streams"].sort(key=lambda stream: rank.get(stream["quality"], len(rank)))
+    sort_streams(result["streams"], config, preferred_quality)
     return result
 
 @app.get("/api/streams/movie/{imdb_id}")

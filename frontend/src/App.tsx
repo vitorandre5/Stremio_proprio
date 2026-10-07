@@ -25,7 +25,7 @@ type TitleDetails = SearchResult & {
   library_status?: { status?: "media" | "strm" | "missing"; path?: string | null; episodes?: { season_number: number; episode_number: number; status: "media" | "strm" | "missing"; path: string | null }[] };
 };
 
-type StreamOption = { name: string; title: string; provider: string; quality: string | null; url: string };
+type StreamOption = { name: string; title: string; provider: string; quality: string | null; language: "dubbed" | "subtitled" | "portuguese_unspecified" | "unknown"; url: string };
 type AddonResource = string | { name?: string; types?: string[]; idPrefixes?: string[] };
 type AddonItem = { id: string; name: string; manifest_url: string; enabled: boolean; manifest?: { resources?: AddonResource[]; types?: string[]; idPrefixes?: string[] } | null };
 type Preferences = { preferred_quality: string; preferred_provider: string };
@@ -36,6 +36,10 @@ function manifestTypes(manifest: AddonItem["manifest"]) {
 
 function manifestPrefixes(manifest: AddonItem["manifest"]) {
   return Array.from(new Set([...(manifest?.idPrefixes || []), ...(manifest?.resources || []).flatMap((resource) => typeof resource === "string" ? [] : resource.idPrefixes || [])]));
+}
+
+function streamLanguageLabel(language: StreamOption["language"]) {
+  return ({ dubbed: "Dublado", subtitled: "Legendado", portuguese_unspecified: "Português · tipo não informado", unknown: "Idioma não informado" })[language];
 }
 
 const FILTERS: { value: SearchFilter; label: string }[] = [
@@ -417,7 +421,7 @@ export default function App() {
                 </div>
                 <div className="detail-body">
                   <div className="detail-block"><h3>Sinopse</h3><p>{details.overview || "Sinopse indisponível para este título."}</p></div>
-                  {details.media_type === "movie" && <div className="detail-block movie-add-block"><h3>Biblioteca</h3><p>{details.library_status?.status === "media" ? "Arquivo de video encontrado." : details.library_status?.status === "strm" ? "Arquivo STRM encontrado." : "Ainda nao adicionado."}</p>{details.library_status?.path && <small>{details.library_status.path}</small>}<button className="episode-action" type="button" onClick={() => void loadMovieStreams()}>Consultar addons</button>{streamState.key === "movie" && <div className="stream-results">{streamState.loading && <p>Consultando addons...</p>}{streamState.error && <p className="error-message">{streamState.error}</p>}{streamState.saved && <p className="success-message">{streamState.saved}</p>}{streamState.streams.map((stream) => <div className="stream-option" key={`${stream.provider}-${stream.url}`}><div><strong>{stream.provider}</strong><span>{stream.quality || stream.name}</span><small>{stream.title}</small></div>{isAdmin && <button type="button" onClick={() => void addMovieStream(stream)}>Adicionar</button>}</div>)}</div>}</div>}
+                  {details.media_type === "movie" && <div className="detail-block movie-add-block"><h3>Biblioteca</h3><p>{details.library_status?.status === "media" ? "Arquivo de video encontrado." : details.library_status?.status === "strm" ? "Arquivo STRM encontrado." : "Ainda nao adicionado."}</p>{details.library_status?.path && <small>{details.library_status.path}</small>}<button className="episode-action" type="button" onClick={() => void loadMovieStreams()}>Consultar addons</button>{streamState.key === "movie" && <div className="stream-results">{streamState.loading && <p>Consultando addons...</p>}{streamState.error && <p className="error-message">{streamState.error}</p>}{streamState.saved && <p className="success-message">{streamState.saved}</p>}{streamState.streams.map((stream) => <div className="stream-option" key={`${stream.provider}-${stream.url}`}><div><strong>{stream.provider} · {streamLanguageLabel(stream.language)}</strong><span>{stream.quality || stream.name}</span><small>{stream.title}</small></div>{isAdmin && <button type="button" onClick={() => void addMovieStream(stream)}>Adicionar</button>}</div>)}</div>}</div>}
                   {details.media_type === "series" && details.seasons && (
                     <div className="detail-block season-summary">
                       <div><h3>Temporadas</h3><span>{details.season_count ?? details.seasons.length} temporadas · {details.episode_count ?? "?"} episódios</span></div>
@@ -437,10 +441,10 @@ export default function App() {
                                   </article>
                                 ))}
                                 {streamState.key.startsWith(`${season.season_number}:`) && <div className="stream-results">
-                                  {streamState.loading && <p>Consultando FrostStream e fallback...</p>}
+                                  {streamState.loading && <p>Consultando addons ativos...</p>}
                                   {streamState.error && <p className="error-message">{streamState.error}</p>}
                                   {streamState.saved && <p className="success-message">{streamState.saved}</p>}
-                                  {streamState.streams.map((stream) => <div className="stream-option" key={`${stream.provider}-${stream.url}`}><div><strong>{stream.provider}</strong><span>{stream.quality || stream.name}</span><small>{stream.title}</small></div>{isAdmin && <button type="button" onClick={() => { const episode = details.episodes.find((item) => `${item.season_number}:${item.episode_number}` === streamState.key); if (episode) void addEpisodeStream(episode, stream); }}>Adicionar</button>}</div>)}
+                                  {streamState.streams.map((stream) => <div className="stream-option" key={`${stream.provider}-${stream.url}`}><div><strong>{stream.provider} · {streamLanguageLabel(stream.language)}</strong><span>{stream.quality || stream.name}</span><small>{stream.title}</small></div>{isAdmin && <button type="button" onClick={() => { const episode = details.episodes.find((item) => `${item.season_number}:${item.episode_number}` === streamState.key); if (episode) void addEpisodeStream(episode, stream); }}>Adicionar</button>}</div>)}
                                 </div>}
                               </div>}
                             </div>
