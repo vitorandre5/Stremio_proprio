@@ -5,6 +5,8 @@ import logging
 import os
 from pathlib import Path
 import re
+import time
+import unicodedata
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, File, HTTPException, Path as PathParam, Query, Request, Response, UploadFile
@@ -43,6 +45,7 @@ from app.proxy.service import has_proxy_headers, proxy_stream
 
 
 logger = logging.getLogger("media_library_manager")
+_SEARCH_AVAILABILITY_CACHE: dict[str, tuple[float, str, list[str]]] = {}
 
 
 @asynccontextmanager
@@ -185,18 +188,72 @@ async def search(
     if not normalized_query:
         return {"results": []}
 
-    results = await search_metadata(normalized_query, media_type)
+    results = await _rank_search_results(normalized_query, await search_metadata(normalized_query, media_type))
     with SessionLocal() as session:
         for item in results:
             record = session.get(MetadataItem, item["id"])
             if record is None:
                 record = MetadataItem(id=item["id"])
                 session.add(record)
-            for field, value in item.items():
-                if field != "id":
-                    setattr(record, field, value)
+            for field in ("media_type", "tmdb_id", "imdb_id", "title", "year", "poster_url", "overview"):
+                setattr(record, field, item.get(field))
         session.commit()
     return {"results": results}
+
+
+def _search_title_rank(query: str, title: str) -> int:
+    def normalize(value: str) -> str:
+        decomposed = unicodedata.normalize("NFKD", value.casefold())
+        without_marks = "".join(character for character in decomposed if not unicodedata.combining(character))
+        return re.sub(r"[^a-z0-9]+", " ", without_marks).strip()
+
+    normalized_query = normalize(query)
+    normalized_title = normalize(title)
+    if normalized_title == normalized_query:
+        return 0
+    if normalized_title.startswith(normalized_query):
+        return 1
+    if normalized_query and normalized_query in normalized_title:
+        return 2
+    query_terms = normalized_query.split()
+    if query_terms and all(term in normalized_title.split() for term in query_terms):
+        return 3
+    return 4
+
+
+async def _rank_search_results(query: str, results: list[dict]) -> list[dict]:
+    semaphore = asyncio.Semaphore(8)
+    now = time.monotonic()
+
+    async def availability(item: dict) -> tuple[str, list[str]]:
+        media_type = item.get("media_type")
+        imdb_id = item.get("imdb_id") or item.get("id")
+        if media_type not in {"movie", "series"} or not isinstance(imdb_id, str) or not re.fullmatch(r"tt\d+", imdb_id):
+            return "unknown", []
+        cache_key = f"{media_type}:{imdb_id}"
+        cached = _SEARCH_AVAILABILITY_CACHE.get(cache_key)
+        if cached and cached[0] > now:
+            return cached[1], cached[2]
+        async with semaphore:
+            try:
+                async with asyncio.timeout(8):
+                    streams = await _streams_for(media_type, imdb_id)
+            except Exception:
+                _SEARCH_AVAILABILITY_CACHE[cache_key] = (time.monotonic() + 30, "unknown", [])
+                return "unknown", []
+        providers = list(dict.fromkeys(stream["provider"] for stream in streams["streams"]))
+        status = "available" if providers else "unknown" if streams["addon_errors"] else "unavailable"
+        _SEARCH_AVAILABILITY_CACHE[cache_key] = (time.monotonic() + (300 if status != "unknown" else 30), status, providers)
+        return status, providers
+
+    checks = await asyncio.gather(*(availability(item) for item in results))
+    availability_rank = {"available": 0, "unknown": 1, "unavailable": 2}
+    ranked = []
+    for original_rank, (item, (status, providers)) in enumerate(zip(results, checks)):
+        ranked_item = {**item, "availability": status, "available_providers": providers}
+        ranked.append((availability_rank[status], _search_title_rank(query, item["title"]), original_rank, ranked_item))
+    ranked.sort(key=lambda entry: entry[:3])
+    return [entry[3] for entry in ranked]
 
 
 @app.get("/api/title/{media_type}/{imdb_id}")

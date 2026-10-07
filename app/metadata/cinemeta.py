@@ -48,10 +48,15 @@ async def search(query: str, media_filter: str = "all") -> list[dict]:
     responses = await asyncio.gather(
         *(_get(f"/catalog/{media_type}/top/search={encoded_query}.json") for media_type in types)
     )
+    catalogs = [
+        [_preview(item, media_type) for item in response.get("metas", [])]
+        for media_type, response in zip(types, responses)
+    ]
     results = []
-    for media_type, response in zip(types, responses):
-        for item in response.get("metas", []):
-            results.append(_preview(item, media_type))
+    for index in range(max((len(catalog) for catalog in catalogs), default=0)):
+        for catalog in catalogs:
+            if index < len(catalog):
+                results.append(catalog[index])
     return results
 
 

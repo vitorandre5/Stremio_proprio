@@ -45,6 +45,8 @@ h2 { margin: 7px 0 0; font: 600 21px Manrope, sans-serif; letter-spacing: -.6px;
 .result-count { margin-bottom: 2px; color: var(--muted); font-size: 12px; }
 .results-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px; padding-top: 18px; }
 .media-card { min-width: 0; display: grid; grid-template-columns: 116px minmax(0, 1fr); gap: 18px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: #171a20; transition: border-color .2s, transform .2s; }
+.media-card.search-unavailable { opacity: .5; }
+.media-card.search-unknown { opacity: .72; }
 .media-card:hover { border-color: rgba(185,242,119,.3); transform: translateY(-2px); }
 .poster-wrap { position: relative; width: 116px; height: 158px; overflow: hidden; border-radius: 7px; background: #22262d; }
 .poster-wrap img { width: 100%; height: 100%; object-fit: cover; }
@@ -53,6 +55,9 @@ h2 { margin: 7px 0 0; font: 600 21px Manrope, sans-serif; letter-spacing: -.6px;
 .card-copy { min-width: 0; display: flex; flex-direction: column; padding: 3px 0 1px; }
 .card-title-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
 .card-title-row h3 { margin: 0; overflow: hidden; color: #f2f2ee; font: 600 15px Manrope, sans-serif; letter-spacing: -.3px; text-overflow: ellipsis; white-space: nowrap; }
+.availability-pill { display: inline-flex; align-self: flex-start; margin-top: 6px; padding: 3px 7px; border: 1px solid var(--line); border-radius: 20px; color: #9b9ea6; font-size: 9px; }
+.availability-pill.available { border-color: rgba(185,242,119,.25); color: var(--accent); }
+.availability-pill.unavailable { color: #a17878; }
 .year { color: #9b9ea6; font-size: 12px; }
 .card-copy > p { display: -webkit-box; overflow: hidden; margin: 10px 0 8px; color: #92959e; font-size: 11px; line-height: 1.55; -webkit-box-orient: vertical; -webkit-line-clamp: 4; }
 .card-footer { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-top: auto; padding-top: 8px; border-top: 1px solid var(--line); color: #747984; font-size: 10px; }

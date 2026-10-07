@@ -13,6 +13,8 @@ type SearchResult = {
   year: number | null;
   poster_url: string | null;
   overview: string;
+  availability?: "available" | "unavailable" | "unknown";
+  available_providers?: string[];
 };
 
 type TitleDetails = SearchResult & {
@@ -495,7 +497,7 @@ export default function App() {
             </div>
             <div className="results-grid">
               {results.map((item) => (
-                <article className="media-card" key={item.id}>
+                <article className={`media-card search-${item.availability || "unknown"}`} key={item.id}>
                   <div className="poster-wrap">
                     {item.poster_url ? (
                       <img src={item.poster_url} alt={`Poster de ${item.title}`} loading="lazy" />
@@ -506,6 +508,11 @@ export default function App() {
                   </div>
                   <div className="card-copy">
                     <div className="card-title-row"><h3>{item.title}</h3>{item.year && <span className="year">{item.year}</span>}</div>
+                    <span className={`availability-pill ${item.availability || "unknown"}`}>
+                      {item.availability === "available"
+                        ? `Disponível · ${(item.available_providers || []).join(", ")}`
+                        : item.availability === "unavailable" ? "Sem fonte nos addons" : "Disponibilidade não confirmada"}
+                    </span>
                     <p>{item.overview || "Sinopse indisponível."}</p>
                     <div className="card-footer">
                       <span>IMDb <b>{item.imdb_id}</b></span>

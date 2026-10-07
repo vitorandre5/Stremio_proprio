@@ -11,13 +11,35 @@ os.environ["SESSION_SECRET"] = "test-session-secret-value-at-least-32-characters
 
 from app.jobs.manager import create_job, get_job, update_job
 from app.library import dynamic
-from app.main import _episode_strm_path, _run_episode_job, app
+from app.main import _episode_strm_path, _rank_search_results, _run_episode_job, app
 from app.stremio.manifest import supports
 from app.security import check_request_rate_limit
 from fastapi.testclient import TestClient
 
 
 class NewFunctionalityTests(unittest.TestCase):
+    def test_search_ranks_titles_with_addon_streams_first(self):
+        results = [
+            {"id": "tt1234567", "imdb_id": "tt1234567", "media_type": "movie", "title": "Mr. Robot", "year": 2025},
+            {"id": "tt4158110", "imdb_id": "tt4158110", "media_type": "series", "title": "Mr. Robot", "year": 2015},
+            {"id": "tt0343818", "imdb_id": "tt0343818", "media_type": "movie", "title": "I, Robot", "year": 2004},
+        ]
+
+        async def streams_for(_media_type, imdb_id):
+            if imdb_id == "tt4158110":
+                return {"streams": [{"provider": "FrostStream"}], "addon_errors": []}
+            return {"streams": [], "addon_errors": []}
+
+        with patch.dict("app.main._SEARCH_AVAILABILITY_CACHE", {}, clear=True), patch(
+            "app.main._streams_for", new=AsyncMock(side_effect=streams_for)
+        ):
+            ranked = asyncio.run(_rank_search_results("Mr. Robot", results))
+
+        self.assertEqual(ranked[0]["imdb_id"], "tt4158110")
+        self.assertEqual(ranked[0]["availability"], "available")
+        self.assertEqual(ranked[0]["available_providers"], ["FrostStream"])
+        self.assertEqual([item["availability"] for item in ranked[1:]], ["unavailable", "unavailable"])
+
     def test_manifest_without_id_prefixes_supports_all_ids(self):
         manifest = {"types": ["series"], "resources": [{"name": "stream", "types": ["series"]}]}
         self.assertTrue(supports(manifest, "stream", "series", "tt4158110"))
