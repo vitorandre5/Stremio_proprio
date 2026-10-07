@@ -1,0 +1,31 @@
+services:
+  media-library-manager:
+    build: .
+    expose:
+      - "8000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////data/media_library.sqlite3}
+      JELLYFIN_URL: ${JELLYFIN_URL:-}
+      JELLYFIN_API_KEY: ${JELLYFIN_API_KEY:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      FROST_MANIFEST_URL: ${FROST_MANIFEST_URL:-https://froststream.cloutteam.com/manifest.json}
+      BESTCINE_MANIFEST_URL: ${BESTCINE_MANIFEST_URL:-https://bestcine.dpdns.org/manifest.json}
+      MEDIA_ROOT: ${MEDIA_ROOT:-/media/stream media}
+    volumes:
+      - app_data:/data
+      - /home/ubuntu/jellyfin/tvshows:/media
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  app_data:
