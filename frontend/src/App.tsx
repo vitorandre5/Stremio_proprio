@@ -421,18 +421,22 @@ export default function App() {
   }
 
   return (
-    <main className="page-shell">
-      <header className="topbar">
+    <div className="app-layout">
+      <aside className="sidebar">
         <a className="brand" href="/" aria-label="Media Library Manager início">
           <span className="brand-mark">M</span>
           <span>Media Library <strong>Manager</strong></span>
         </a>
-        <div className="topbar-actions">
-          {currentUser && <span className="topbar-label">{currentUser}</span>}
-          {isAdmin && <button className="nav-button" type="button" onClick={() => view === "settings" ? setView("library") : void openSettings()}>{view === "settings" ? "Biblioteca" : "Configuracoes"}</button>}
-          {currentUser && <button className="nav-button" type="button" onClick={() => void handleLogout()}>Sair</button>}
+        <nav className="sidebar-nav" aria-label="Navegação principal">
+          <button className={`sidebar-link ${view === "library" ? "active" : ""}`} type="button" onClick={() => setView("library")}><span aria-hidden="true">⌕</span>Descobrir</button>
+          {isAdmin && <button className={`sidebar-link ${view === "settings" ? "active" : ""}`} type="button" onClick={() => view === "settings" ? setView("library") : void openSettings()}><span aria-hidden="true">⚙</span>Configurações</button>}
+        </nav>
+        <div className="sidebar-account">
+          {currentUser && <span className="sidebar-user" title={currentUser}><span className="user-avatar" aria-hidden="true">{currentUser.slice(0, 1).toUpperCase()}</span><span>{currentUser}</span></span>}
+          {currentUser && <button className="sidebar-link logout-button" type="button" onClick={() => void handleLogout()}><span aria-hidden="true">↪</span>Sair</button>}
         </div>
-      </header>
+      </aside>
+      <main className="page-shell">
 
       {view === "settings" ? (
         <section className="settings-page">
@@ -606,6 +610,7 @@ export default function App() {
           </section>
         </div>
       )}
-    </main>
+      </main>
+    </div>
   );
 }
