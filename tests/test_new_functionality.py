@@ -30,12 +30,15 @@ class NewFunctionalityTests(unittest.TestCase):
             signature = target.split("sig=")[1]
             with TestClient(app) as client, patch(
                 "app.main._streams_for",
-                new=AsyncMock(return_value={"streams": [{"provider_id": "com.froststream", "url": "https://video.example.test/file.mkv"}]}),
-            ):
+                new=AsyncMock(return_value={"streams": [
+                    {"provider_id": "com.froststream", "url": "https://video.example.test/expired.mkv"},
+                    {"provider_id": "com.fenixflix", "url": "https://video.example.test/working.mkv"},
+                ]}),
+            ), patch("app.main._verified_provider", return_value="com.fenixflix"):
                 response = client.get(target.replace("https://media.example.test", ""), follow_redirects=False)
                 tampered = client.get(target.replace(signature, "0" * 64), follow_redirects=False)
             self.assertEqual(response.status_code, 307)
-            self.assertEqual(response.headers["location"], "https://video.example.test/file.mkv")
+            self.assertEqual(response.headers["location"], "https://video.example.test/working.mkv")
             self.assertEqual(len(signature), 64)
             self.assertEqual(tampered.status_code, 404)
 

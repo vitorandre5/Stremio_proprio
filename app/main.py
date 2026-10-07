@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Path as PathParam, Qu
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from sqlalchemy import inspect, text
 from typing import Literal
 
 from app.database.db import Base, SessionLocal, engine
@@ -47,6 +48,10 @@ logger = logging.getLogger("media_library_manager")
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
+    check_columns = {column["name"] for column in inspect(engine).get_columns("link_checks")}
+    if "provider_id" not in check_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE link_checks ADD COLUMN provider_id VARCHAR(160)"))
     mark_interrupted_jobs()
     with SessionLocal() as session:
         for addon_id, name, manifest_url in (
@@ -222,6 +227,7 @@ def _get_link_checks(imdb_id: str) -> dict[str, dict]:
     with SessionLocal() as session:
         rows = session.query(LinkCheck).join(LibraryItem, LinkCheck.library_item_id == LibraryItem.id).filter(LibraryItem.imdb_id == imdb_id).all()
         return {row.library_item_id: {"status": row.status, "checked_at": row.checked_at, "provider": row.provider,
+                                      "provider_id": row.provider_id,
                                       "quality": row.quality, "http_status": row.http_status, "message": row.message}
                 for row in rows}
 
@@ -232,7 +238,13 @@ def _get_link_check(item_id: str) -> dict | None:
         if row is None:
             return None
         return {"status": row.status, "checked_at": row.checked_at, "provider": row.provider,
+                "provider_id": row.provider_id,
                 "quality": row.quality, "http_status": row.http_status, "message": row.message}
+
+
+def _verified_provider(item_id: str) -> str | None:
+    check = _get_link_check(item_id)
+    return check.get("provider_id") if check and check.get("status") == "available" else None
 
 
 @app.get("/api/library/checks/{media_type}/{imdb_id}")
@@ -361,11 +373,13 @@ async def _resolve_dynamic_stream(
     if not verify_dynamic_signature(media_type, imdb_id, provider, signature, season, episode):
         raise HTTPException(status_code=404, detail="Assinatura do STRM invalida.")
     video_id = imdb_id if media_type == "movie" else f"{imdb_id}:{season}:{episode}"
-    result = await _streams_for(media_type, video_id, preferred_provider_override=provider)
+    item_id = f"movie:{imdb_id}" if media_type == "movie" else f"series:{imdb_id}:{season}:{episode}"
+    selected_provider = _verified_provider(item_id) or provider
+    result = await _streams_for(media_type, video_id, preferred_provider_override=selected_provider)
     if not result["streams"]:
         logger.warning("No direct stream for dynamic item %s (%s)", imdb_id, media_type)
         raise HTTPException(status_code=503, detail="Nenhum stream direto esta disponivel neste momento.")
-    selected = next((stream for stream in result["streams"] if stream["provider_id"] == provider), result["streams"][0])
+    selected = next((stream for stream in result["streams"] if stream["provider_id"] == selected_provider), result["streams"][0])
     if has_proxy_headers(selected):
         return await proxy_stream(selected["url"], request, selected["behavior_hints"])
     return RedirectResponse(selected["url"], status_code=307)

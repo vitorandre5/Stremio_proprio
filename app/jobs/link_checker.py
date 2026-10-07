@@ -35,6 +35,7 @@ def _save_check(item_id: str, status: str, message: str, stream: dict | None = N
         record.status = status
         record.checked_at = _now()
         record.provider = stream.get("provider") if stream else None
+        record.provider_id = stream.get("provider_id") if stream else None
         record.quality = stream.get("quality") if stream else None
         record.http_status = http_status
         record.message = message[:240]
