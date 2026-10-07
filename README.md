@@ -43,7 +43,9 @@ Frontend TypeScript, imagem Docker e Compose foram validados localmente; os test
 
 No site publicado, a busca por `Mr. Robot` retornou a serie de 2015 (`tt4158110`), quatro temporadas, 45 episodios, sinopse e elenco. A consulta ao S01E01 retornou uma fonte direta FenixFlix 1080p dublada. FrostStream e BestCine nao forneceram stream utilizavel no teste mais recente; o fallback FenixFlix funcionou. O PopPlay informado pelo usuario permanece indisponivel por falha de DNS, portanto nao foi adicionado como fonte funcional.
 
-Os testes de upload usaram diretorios temporarios e nenhum arquivo foi adicionado a biblioteca de producao durante esta verificacao. Playback final e scan Jellyfin de um novo item dependem da `JELLYFIN_API_KEY` estar preenchida corretamente no Coolify.
+O checker ativo no Coolify identificou 10/10 arquivos da temporada 1 existentes e testou os links: 3 responderam e 7 falharam com HTTP 400/404/408. O provider que passou e usado como preferencia na proxima resolucao dinâmica, que consulta o addon novamente para gerar URL atual.
+
+`refresh_library()` foi executado no container de producao sem imprimir a chave; Jellyfin aceitou `POST /Library/Refresh` e a solicitacao de scan foi confirmada. O teste de criacao e verificacao de `.strm` usa armazenamento temporario, sem novo arquivo criado na biblioteca de producao. Playback integral de um novo item ainda nao foi validado.
 
 ## Testes locais
 
