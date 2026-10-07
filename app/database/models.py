@@ -44,3 +44,19 @@ class Preference(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     preferred_quality: Mapped[str] = mapped_column(String(16), default="1080p")
     preferred_provider: Mapped[str] = mapped_column(String(160), default="automatic")
+
+
+class Job(Base):
+    __tablename__ = "jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    owner_id: Mapped[str] = mapped_column(String(120), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    completed: Mapped[int] = mapped_column(Integer, default=0)
+    failed: Mapped[int] = mapped_column(Integer, default=0)
+    message: Mapped[str] = mapped_column(String(500), default="Na fila")
+    result_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[str] = mapped_column(String(32))
+    updated_at: Mapped[str] = mapped_column(String(32))

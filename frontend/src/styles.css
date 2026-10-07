@@ -167,4 +167,13 @@ h2 { margin: 7px 0 0; font: 600 21px Manrope, sans-serif; letter-spacing: -.6px;
 .library-state.media, .library-state.strm { color: var(--accent); }
 .movie-add-block { display: grid; gap: 9px; }
 .movie-add-block small { color: var(--muted); overflow-wrap: anywhere; }
+.upload-action { position: relative; justify-self: start; display: inline-flex; align-items: center; cursor: pointer; }
+.upload-action input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+.series-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.season-add { margin: 0 12px 12px; }
+.job-progress { display: grid; gap: 10px; margin-bottom: 20px; text-align: left; }
+.job-progress > div { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+.job-progress strong { color: #e8e8e4; font-size: 12px; }
+.job-progress span { flex: 0 0 auto; color: var(--muted); font-size: 11px; }
+.job-progress progress { width: 100%; height: 8px; accent-color: var(--accent); }
 @media (max-width: 700px) { .settings-grid { grid-template-columns: 1fr; } .settings-heading h1 { font-size: 30px; } .topbar-actions { gap: 8px; } }

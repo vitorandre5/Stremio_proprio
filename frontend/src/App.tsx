@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 
 type MediaType = "movie" | "series";
 type SearchFilter = "all" | MediaType;
@@ -29,6 +29,7 @@ type StreamOption = { name: string; title: string; provider: string; quality: st
 type AddonResource = string | { name?: string; types?: string[]; idPrefixes?: string[] };
 type AddonItem = { id: string; name: string; manifest_url: string; enabled: boolean; manifest?: { resources?: AddonResource[]; types?: string[]; idPrefixes?: string[] } | null };
 type Preferences = { preferred_quality: string; preferred_provider: string };
+type JobSnapshot = { id: string; kind: string; status: "queued" | "uploading" | "running" | "completed" | "failed"; total: number; completed: number; failed: number; message: string; result: Record<string, unknown> };
 
 function manifestTypes(manifest: AddonItem["manifest"]) {
   return Array.from(new Set([...(manifest?.types || []), ...(manifest?.resources || []).flatMap((resource) => typeof resource === "string" ? [] : resource.types || [])]));
@@ -76,6 +77,8 @@ export default function App() {
   const [settingsMessage, setSettingsMessage] = useState("");
   const [authError, setAuthError] = useState("");
   const [streamState, setStreamState] = useState<{ key: string; loading: boolean; streams: StreamOption[]; error: string; saved: string }>({ key: "", loading: false, streams: [], error: "", saved: "" });
+  const [jobState, setJobState] = useState<JobSnapshot | null>(null);
+  const jobEvents = useRef<EventSource | null>(null);
 
   useEffect(() => {
     fetch("/api/session").then(async (response) => {
@@ -87,6 +90,8 @@ export default function App() {
       setAuthState("ready");
     }).catch(() => setAuthState("login"));
   }, []);
+
+  useEffect(() => () => jobEvents.current?.close(), []);
 
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -252,6 +257,88 @@ export default function App() {
     }
   }
 
+  async function refreshSelectedDetails() {
+    if (!selected?.imdb_id) return;
+    const response = await fetch(`/api/title/${selected.media_type}/${selected.imdb_id}`);
+    const payload = await response.json();
+    if (response.ok) setDetails(payload);
+  }
+
+  function watchJob(jobId: string) {
+    jobEvents.current?.close();
+    const events = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/events`);
+    jobEvents.current = events;
+    events.onmessage = (message) => {
+      const job = JSON.parse(message.data) as JobSnapshot;
+      setJobState(job);
+      if (job.status === "completed" || job.status === "failed") {
+        events.close();
+        jobEvents.current = null;
+        void refreshSelectedDetails();
+      }
+    };
+    events.onerror = () => {
+      setJobState((current) => current?.id === jobId ? { ...current, message: "Reconectando ao progresso do job..." } : current);
+    };
+  }
+
+  async function startJob(endpoint: string) {
+    setJobState(null);
+    try {
+      const response = await fetch(endpoint, { method: "POST", headers: { "X-CSRF-Token": csrfToken } });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Nao foi possivel iniciar o job.");
+      setJobState({ id: data.job_id, kind: "library", status: "queued", total: data.total || 0, completed: 0, failed: 0, message: "Job iniciado.", result: {} });
+      watchJob(data.job_id);
+    } catch (cause) {
+      setJobState({ id: "error", kind: "library", status: "failed", total: 0, completed: 0, failed: 1, message: cause instanceof Error ? cause.message : "Falha ao iniciar job.", result: {} });
+    }
+  }
+
+  async function startImport(endpoint: string, file: File) {
+    setJobState(null);
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+        body: JSON.stringify({ filename: file.name, size: file.size }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Nao foi possivel iniciar a importacao.");
+      setJobState({ id: data.job_id, kind: "import", status: "uploading", total: file.size, completed: 0, failed: 0, message: "Enviando arquivo...", result: {} });
+      watchJob(data.job_id);
+      const formData = new FormData();
+      formData.append("file", file);
+      const upload = new XMLHttpRequest();
+      upload.open("PUT", data.upload_url);
+      upload.withCredentials = true;
+      upload.setRequestHeader("X-CSRF-Token", csrfToken);
+      upload.upload.onprogress = (event) => {
+        if (event.lengthComputable) setJobState((current) => {
+          if (!current || current.id !== data.job_id) return current;
+          return { ...current, total: event.total, completed: event.loaded, message: `Enviando arquivo: ${Math.floor((event.loaded / event.total) * 100)}%.` };
+        });
+      };
+      upload.onerror = () => setJobState((current) => {
+        if (!current || current.id !== data.job_id) return current;
+        return { ...current, status: "failed", failed: 1, message: "A conexao caiu durante o upload." };
+      });
+      upload.onload = () => {
+        if (upload.status < 200 || upload.status >= 300) {
+          let detail = "Falha ao enviar arquivo.";
+          try { detail = JSON.parse(upload.responseText).detail || detail; } catch { /* response may be empty */ }
+          setJobState((current) => {
+            if (!current || current.id !== data.job_id) return current;
+            return { ...current, status: "failed", failed: 1, message: detail };
+          });
+        }
+      };
+      upload.send(formData);
+    } catch (cause) {
+      setJobState({ id: "error", kind: "import", status: "failed", total: 0, completed: 0, failed: 1, message: cause instanceof Error ? cause.message : "Falha ao iniciar importacao.", result: {} });
+    }
+  }
+
   if (authState === "checking") return <main className="auth-shell">Verificando sessão...</main>;
   if (authState === "login") return <main className="auth-shell"><form className="auth-card" onSubmit={handleLogin}><span className="eyebrow">MEDIA LIBRARY MANAGER</span><h1>Acesse sua biblioteca</h1><label htmlFor="jellyfin-username">Usu?rio Jellyfin</label><input id="jellyfin-username" type="text" autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required /><label htmlFor="jellyfin-password">Senha Jellyfin</label><input id="jellyfin-password" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /><button type="submit">Entrar</button>{authError && <p className="error-message">{authError}</p>}</form></main>;
 
@@ -323,7 +410,7 @@ export default function App() {
               </article>)}
               <form className="settings-form" onSubmit={handleAddonSubmit}><h3>Adicionar addon</h3><label>Nome<input value={addonName} onChange={(event) => setAddonName(event.target.value)} maxLength={120} required /></label><label>Manifest URL<input type="url" value={manifestUrl} onChange={(event) => setManifestUrl(event.target.value)} placeholder="https://addon.example/manifest.json" required /></label><button type="submit" disabled={!addonName.trim() || !manifestUrl.trim()}>Validar e cadastrar</button></form>
             </section>
-            <section className="settings-card"><span className="eyebrow">REPRODUCAO</span><h2>Preferencias de stream</h2><form className="settings-form" onSubmit={savePreferences}><label>Qualidade preferida<select value={preferences.preferred_quality} onChange={(event) => setPreferences((current) => ({ ...current, preferred_quality: event.target.value }))}>{["2160p", "1440p", "1080p", "720p", "480p"].map((quality) => <option key={quality}>{quality}</option>)}</select></label><label>Provider preferido<select value={preferences.preferred_provider} onChange={(event) => setPreferences((current) => ({ ...current, preferred_provider: event.target.value }))}><option value="automatic">Automatico (FrostStream primeiro)</option>{addons.filter((addon) => addon.enabled).map((addon) => <option value={addon.id} key={addon.id}>{addon.name}</option>)}</select></label><p>Se o provider preferido nao retornar um stream direto, o sistema tenta os demais addons ativos.</p><button type="submit">Salvar preferencias</button></form></section>
+            <section className="settings-card"><span className="eyebrow">REPRODUCAO</span><h2>Preferencias de stream</h2><form className="settings-form" onSubmit={savePreferences}><label>Qualidade preferida<select value={preferences.preferred_quality} onChange={(event) => setPreferences((current) => ({ ...current, preferred_quality: event.target.value }))}>{["2160p", "1440p", "1080p", "720p", "480p"].map((quality) => <option key={quality}>{quality}</option>)}</select></label><label>Provider preferido<select value={preferences.preferred_provider} onChange={(event) => setPreferences((current) => ({ ...current, preferred_provider: event.target.value }))}><option value="automatic">Automatico (dublado primeiro)</option>{addons.filter((addon) => addon.enabled).map((addon) => <option value={addon.id} key={addon.id}>{addon.name}</option>)}</select></label><p>Dublado sempre vem primeiro; provider e qualidade definem a ordem entre opcoes do mesmo idioma.</p><button type="submit">Salvar preferencias</button></form></section>
           </div>}
         </section>
       ) : <>
@@ -420,11 +507,13 @@ export default function App() {
                   </div>
                 </div>
                 <div className="detail-body">
+                  {jobState && <div className={`message job-progress ${jobState.status === "failed" ? "error-message" : ""}`} aria-live="polite"><div><strong>{jobState.message}</strong><span>{jobState.total ? `${jobState.completed.toLocaleString()} / ${jobState.total.toLocaleString()}` : jobState.status}</span></div>{jobState.total > 0 && <progress max={jobState.total} value={Math.min(jobState.completed, jobState.total)} />}</div>}
                   <div className="detail-block"><h3>Sinopse</h3><p>{details.overview || "Sinopse indisponível para este título."}</p></div>
-                  {details.media_type === "movie" && <div className="detail-block movie-add-block"><h3>Biblioteca</h3><p>{details.library_status?.status === "media" ? "Arquivo de video encontrado." : details.library_status?.status === "strm" ? "Arquivo STRM encontrado." : "Ainda nao adicionado."}</p>{details.library_status?.path && <small>{details.library_status.path}</small>}<button className="episode-action" type="button" onClick={() => void loadMovieStreams()}>Consultar addons</button>{streamState.key === "movie" && <div className="stream-results">{streamState.loading && <p>Consultando addons...</p>}{streamState.error && <p className="error-message">{streamState.error}</p>}{streamState.saved && <p className="success-message">{streamState.saved}</p>}{streamState.streams.map((stream) => <div className="stream-option" key={`${stream.provider}-${stream.url}`}><div><strong>{stream.provider} · {streamLanguageLabel(stream.language)}</strong><span>{stream.quality || stream.name}</span><small>{stream.title}</small></div>{isAdmin && <button type="button" onClick={() => void addMovieStream(stream)}>Adicionar</button>}</div>)}</div>}</div>}
+                  {details.media_type === "movie" && <div className="detail-block movie-add-block"><h3>Biblioteca</h3><p>{details.library_status?.status === "media" ? "Arquivo de video encontrado." : details.library_status?.status === "strm" ? "Arquivo STRM encontrado." : "Ainda nao adicionado."}</p>{details.library_status?.path && <small>{details.library_status.path}</small>}<button className="episode-action" type="button" onClick={() => void loadMovieStreams()}>Consultar addons</button>{isAdmin && <label className="episode-action upload-action">Importar arquivo local<input type="file" accept=".mp4,.mkv,.webm,video/mp4,video/x-matroska,video/webm" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file && details.imdb_id) void startImport(`/api/jobs/import/movie/${details.imdb_id}`, file); }} /></label>}{streamState.key === "movie" && <div className="stream-results">{streamState.loading && <p>Consultando addons...</p>}{streamState.error && <p className="error-message">{streamState.error}</p>}{streamState.saved && <p className="success-message">{streamState.saved}</p>}{streamState.streams.map((stream) => <div className="stream-option" key={`${stream.provider}-${stream.url}`}><div><strong>{stream.provider} · {streamLanguageLabel(stream.language)}</strong><span>{stream.quality || stream.name}</span><small>{stream.title}</small></div>{isAdmin && <button type="button" onClick={() => void addMovieStream(stream)}>Adicionar</button>}</div>)}</div>}</div>}
                   {details.media_type === "series" && details.seasons && (
                     <div className="detail-block season-summary">
                       <div><h3>Temporadas</h3><span>{details.season_count ?? details.seasons.length} temporadas · {details.episode_count ?? "?"} episódios</span></div>
+                      {isAdmin && <div className="series-actions"><button className="episode-action" type="button" onClick={() => void startJob(`/api/library/add/series/${details.imdb_id}`)}>Adicionar s?rie inteira</button><button className="episode-action" type="button" onClick={() => void startJob(`/api/library/sync/series/${details.imdb_id}`)}>Sincronizar s?rie</button></div>}
                       <div className="season-list">
                         {details.seasons.map((season) => {
                           const episodes = details.episodes.filter((episode) => episode.season_number === season.season_number);
@@ -433,11 +522,12 @@ export default function App() {
                               <button className="season-toggle" type="button" onClick={() => setOpenSeason(openSeason === season.season_number ? null : season.season_number)}>
                                 <span>{season.name}</span><span>{details.library_status?.episodes?.filter((item) => item.season_number === season.season_number && item.status !== "missing").length || 0} / {season.episode_count} <b>{openSeason === season.season_number ? "-" : "+"}</b></span>
                               </button>
+                              {isAdmin && <button className="episode-action season-add" type="button" onClick={() => void startJob(`/api/library/add/series/${details.imdb_id}/season/${season.season_number}`)}>Adicionar temporada</button>}
                               {openSeason === season.season_number && <div className="episode-list">
                                 {episodes.map((episode) => (
                                   <article className="episode-row" key={`${episode.season_number}-${episode.episode_number}`}>
                                     <span className="episode-number">S{String(episode.season_number).padStart(2, "0")}E{String(episode.episode_number).padStart(2, "0")}</span>
-                                    <div className="episode-copy"><strong>{episode.title}</strong><small className={`library-state ${details.library_status?.episodes?.find((item) => item.season_number === episode.season_number && item.episode_number === episode.episode_number)?.status || "missing"}`}>{details.library_status?.episodes?.find((item) => item.season_number === episode.season_number && item.episode_number === episode.episode_number)?.status === "media" ? "Video local" : details.library_status?.episodes?.find((item) => item.season_number === episode.season_number && item.episode_number === episode.episode_number)?.status === "strm" ? "STRM" : "Nao adicionado"}</small><p>{episode.overview || "Sinopse indisponível."}</p><button className="episode-action" type="button" onClick={() => loadEpisodeStreams(episode)}>Consultar addons</button></div>
+                                    <div className="episode-copy"><strong>{episode.title}</strong><small className={`library-state ${details.library_status?.episodes?.find((item) => item.season_number === episode.season_number && item.episode_number === episode.episode_number)?.status || "missing"}`}>{details.library_status?.episodes?.find((item) => item.season_number === episode.season_number && item.episode_number === episode.episode_number)?.status === "media" ? "Video local" : details.library_status?.episodes?.find((item) => item.season_number === episode.season_number && item.episode_number === episode.episode_number)?.status === "strm" ? "STRM" : "Nao adicionado"}</small><p>{episode.overview || "Sinopse indisponível."}</p><button className="episode-action" type="button" onClick={() => loadEpisodeStreams(episode)}>Consultar addons</button>{isAdmin && <label className="episode-action upload-action">Importar arquivo local<input type="file" accept=".mp4,.mkv,.webm,video/mp4,video/x-matroska,video/webm" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file && details.imdb_id) void startImport(`/api/jobs/import/series/${details.imdb_id}/${episode.season_number}/${episode.episode_number}`, file); }} /></label>}</div>
                                   </article>
                                 ))}
                                 {streamState.key.startsWith(`${season.season_number}:`) && <div className="stream-results">

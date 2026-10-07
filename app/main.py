@@ -1,10 +1,14 @@
 from contextlib import asynccontextmanager
+import asyncio
 import json
+import logging
+import os
 from pathlib import Path
 import re
 from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, HTTPException, Path as PathParam, Query, Request, Response
+from fastapi import Depends, FastAPI, File, HTTPException, Path as PathParam, Query, Request, Response, UploadFile
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import Literal
@@ -12,8 +16,9 @@ from typing import Literal
 from app.database.db import Base, SessionLocal, engine
 from app.database.models import Addon, LibraryItem, MetadataItem, Preference
 from app.jellyfin.client import authenticate_user, refresh_library
+from app.library.dynamic import dynamic_signature, dynamic_strm_url, verify_dynamic_signature
 from app.library.service import scan_movie, scan_series, series_folder_name, title_folder_name
-from app.config import BESTCINE_MANIFEST_URL, COOKIE_SECURE, FENIXFLIX_MANIFEST_URL, FROST_MANIFEST_URL, MEDIA_ROOT
+from app.config import BESTCINE_MANIFEST_URL, COOKIE_SECURE, FENIXFLIX_MANIFEST_URL, FROST_MANIFEST_URL, MAX_UPLOAD_BYTES, MEDIA_ROOT
 from app.metadata.cinemeta import details as get_metadata_details
 from app.metadata.cinemeta import search as search_metadata
 from app.stremio.client import read_manifest as read_addon_manifest
@@ -29,12 +34,20 @@ from app.security import (
     require_session,
     check_login_rate_limit,
     record_login_attempt,
+    check_request_rate_limit,
+    session_user,
 )
+from app.jobs.manager import can_access_job, create_job, get_job, mark_interrupted_jobs, start_task, update_job
+from app.proxy.service import has_proxy_headers, proxy_stream
+
+
+logger = logging.getLogger("media_library_manager")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
+    mark_interrupted_jobs()
     with SessionLocal() as session:
         for addon_id, name, manifest_url in (
             ("com.froststream", "FrostStream", FROST_MANIFEST_URL),
@@ -50,6 +63,41 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Media Library Manager", version="0.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def limit_expensive_requests(request: Request, call_next):
+    path = request.url.path
+    if path == "/api/search":
+        scope, limit, window = "search", 40, 60
+    elif path.startswith("/api/streams/"):
+        scope, limit, window = "streams", 90, 60
+    elif path.startswith("/stream/"):
+        scope, limit, window = "dynamic-stream", 120, 60
+    elif path.startswith("/api/addons"):
+        scope, limit, window = "addons", 60 if request.method == "GET" else 20, 60
+    elif path.startswith("/api/library/"):
+        scope, limit, window = "library", 30, 60
+    elif path.startswith("/api/jobs/") and path.endswith("/events"):
+        scope, limit, window = "job-events", 20, 60
+    elif path.endswith("/upload") and request.method == "PUT":
+        scope, limit, window = "upload", 10, 3600
+        try:
+            content_length = int(request.headers.get("content-length", "0"))
+        except ValueError:
+            content_length = 0
+        if content_length > MAX_UPLOAD_BYTES + 1024 * 1024:
+            return JSONResponse({"detail": "O upload excede o limite configurado."}, status_code=413)
+    elif path.startswith("/api/jobs/") and request.method in {"POST", "PUT"}:
+        scope, limit, window = "jobs", 20, 60
+    else:
+        return await call_next(request)
+
+    user = session_user(request.cookies.get(SESSION_COOKIE))
+    identity = f"user:{user['user_id']}" if user else f"client:{request.client.host if request.client else 'unknown'}"
+    if not check_request_rate_limit(identity, scope, limit, window):
+        return JSONResponse({"detail": "Muitas solicitações. Aguarde antes de tentar novamente."}, status_code=429)
+    return await call_next(request)
 
 
 class LoginPayload(BaseModel):
@@ -73,6 +121,11 @@ class AddonEnabledPayload(BaseModel):
 class PreferencesPayload(BaseModel):
     preferred_quality: Literal["2160p", "1440p", "1080p", "720p", "480p"]
     preferred_provider: str = Field(min_length=1, max_length=160)
+
+
+class ImportJobPayload(BaseModel):
+    filename: str = Field(min_length=1, max_length=260)
+    size: int = Field(gt=0, le=MAX_UPLOAD_BYTES)
 
 
 @app.get("/api/session")
@@ -111,6 +164,7 @@ def health() -> dict[str, str]:
 
 @app.get("/api/search")
 async def search(
+    _: None = Depends(require_session),
     query: str = Query(min_length=1, max_length=100),
     media_type: Literal["all", "movie", "series"] = "all",
 ) -> dict:
@@ -218,12 +272,12 @@ async def update_preferences(payload: PreferencesPayload, _: None = Depends(requ
     return payload.model_dump()
 
 
-async def _streams_for(media_type: str, video_id: str) -> dict:
+async def _streams_for(media_type: str, video_id: str, preferred_provider_override: str | None = None) -> dict:
     with SessionLocal() as session:
         addons = session.query(Addon).filter(Addon.enabled.is_(True)).order_by(Addon.id).all()
         config = [{"id": addon.id, "name": addon.name, "manifest_url": addon.manifest_url} for addon in addons]
         preference = session.get(Preference, 1)
-        preferred_provider = preference.preferred_provider if preference else "automatic"
+        preferred_provider = preferred_provider_override or (preference.preferred_provider if preference else "automatic")
         preferred_quality = preference.preferred_quality if preference else "1080p"
     config.sort(key=lambda addon: (
         0 if preferred_provider != "automatic" and addon["id"] == preferred_provider else 1,
@@ -252,6 +306,52 @@ async def episode_streams(
         raise HTTPException(status_code=422, detail="IMDb ID inválido.")
     video_id = f"{imdb_id}:{season}:{episode}"
     return await _streams_for("series", video_id)
+
+
+async def _resolve_dynamic_stream(
+    request: Request,
+    media_type: str,
+    imdb_id: str,
+    provider: str,
+    signature: str,
+    season: int | None = None,
+    episode: int | None = None,
+):
+    if not re.fullmatch(r"tt\d+", imdb_id) or len(provider) > 160:
+        raise HTTPException(status_code=404, detail="STRM dinamico invalido.")
+    if not verify_dynamic_signature(media_type, imdb_id, provider, signature, season, episode):
+        raise HTTPException(status_code=404, detail="Assinatura do STRM invalida.")
+    video_id = imdb_id if media_type == "movie" else f"{imdb_id}:{season}:{episode}"
+    result = await _streams_for(media_type, video_id, preferred_provider_override=provider)
+    if not result["streams"]:
+        logger.warning("No direct stream for dynamic item %s (%s)", imdb_id, media_type)
+        raise HTTPException(status_code=503, detail="Nenhum stream direto esta disponivel neste momento.")
+    selected = next((stream for stream in result["streams"] if stream["provider_id"] == provider), result["streams"][0])
+    if has_proxy_headers(selected):
+        return await proxy_stream(selected["url"], request, selected["behavior_hints"])
+    return RedirectResponse(selected["url"], status_code=307)
+
+
+@app.get("/stream/movie/{imdb_id}")
+async def dynamic_movie_stream(
+    request: Request,
+    imdb_id: str,
+    provider: str = Query(min_length=1, max_length=160),
+    sig: str = Query(min_length=64, max_length=64),
+):
+    return await _resolve_dynamic_stream(request, "movie", imdb_id, provider, sig)
+
+
+@app.get("/stream/series/{imdb_id}/{season}/{episode}")
+async def dynamic_episode_stream(
+    request: Request,
+    imdb_id: str,
+    season: int = PathParam(ge=0, le=99),
+    episode: int = PathParam(gt=0, le=999),
+    provider: str = Query(min_length=1, max_length=160),
+    sig: str = Query(min_length=64, max_length=64),
+):
+    return await _resolve_dynamic_stream(request, "series", imdb_id, provider, sig, season, episode)
 
 
 def _safe_name(value: str) -> str:
@@ -302,7 +402,8 @@ async def add_movie(
         raise HTTPException(status_code=422, detail="A opção selecionada expirou. Consulte os streams novamente.")
     title = name
     rel = Path(name) / f"{name}.strm"
-    result = _write_strm(rel, stream["url"], f"movie:{imdb_id}", "movie", imdb_id, title)
+    dynamic_url = dynamic_strm_url("movie", imdb_id, stream["provider_id"])
+    result = _write_strm(rel, dynamic_url, f"movie:{imdb_id}", "movie", imdb_id, title)
     if result["added"]:
         try:
             await refresh_library()
@@ -345,7 +446,8 @@ async def add_episode(
     filename = _safe_name(f"{series_name} - {code}") + ".strm"
     rel = Path(_safe_name(series_name)) / season_name / filename
     item_id = f"series:{imdb_id}:{season}:{episode}"
-    result = _write_strm(rel, stream["url"], item_id, "series", imdb_id, selected["title"])
+    dynamic_url = dynamic_strm_url("series", imdb_id, stream["provider_id"], season, episode)
+    result = _write_strm(rel, dynamic_url, item_id, "series", imdb_id, selected["title"])
     if result["added"]:
         try:
             await refresh_library()
@@ -356,6 +458,321 @@ async def add_episode(
             result["jellyfin_scan_error"] = exc.detail
             result["message"] = f"Arquivo .strm criado, mas o scan Jellyfin falhou: {exc.detail}"
     return result
+
+
+def _save_metadata(details: dict) -> None:
+    with SessionLocal() as session:
+        record = session.get(MetadataItem, details["id"])
+        if record is None:
+            record = MetadataItem(id=details["id"])
+            session.add(record)
+        for field in ("media_type", "tmdb_id", "imdb_id", "title", "year", "poster_url", "overview"):
+            setattr(record, field, details.get(field))
+        session.commit()
+
+
+def _media_path(relative_path: Path) -> Path:
+    root = Path(MEDIA_ROOT).resolve()
+    target = (root / relative_path).resolve()
+    if root not in target.parents:
+        raise HTTPException(status_code=422, detail="Caminho de midia invalido.")
+    return target
+
+
+def _episode_strm_path(details: dict, season: int, episode: int) -> Path:
+    series_name = series_folder_name(details["title"], details.get("year"), details.get("year_end"))
+    code = f"S{season:02d}E{episode:02d}"
+    return Path(_safe_name(series_name)) / f"Season {season:02d}" / f"{_safe_name(series_name)} - {code}.strm"
+
+
+def _episode_item_id(imdb_id: str, season: int, episode: int) -> str:
+    return f"series:{imdb_id}:{season}:{episode}"
+
+
+async def _run_episode_job(job_id: str, details: dict, episodes: list[dict], kind: str) -> None:
+    update_job(job_id, status="running", total=len(episodes), completed=0, failed=0, message="Atualizando metadata e verificando arquivos existentes.")
+    _save_metadata(details)
+    added = skipped = unavailable = failed = 0
+    for index, episode in enumerate(episodes, start=1):
+        season = int(episode["season_number"])
+        number = int(episode["episode_number"])
+        try:
+            status = scan_series(MEDIA_ROOT, details["title"], details.get("year"), details.get("year_end"), details.get("episodes", []))
+            existing = next((item for item in status["episodes"] if item["season_number"] == season and item["episode_number"] == number), None)
+            if existing and existing["status"] != "missing":
+                skipped += 1
+                message = f"S{season:02d}E{number:02d}: arquivo existente preservado."
+            else:
+                item_id = _episode_item_id(details["imdb_id"], season, number)
+                streams = (await _streams_for("series", f"{details['imdb_id']}:{season}:{number}"))["streams"]
+                if not streams:
+                    unavailable += 1
+                    message = f"S{season:02d}E{number:02d}: nenhuma fonte direta disponivel."
+                else:
+                    dynamic_url = dynamic_strm_url("series", details["imdb_id"], streams[0]["provider_id"], season, number)
+                    outcome = _write_strm(
+                        _episode_strm_path(details, season, number),
+                        dynamic_url,
+                        item_id,
+                        "series",
+                        details["imdb_id"],
+                        episode["title"],
+                    )
+                    if outcome["added"]:
+                        added += 1
+                    else:
+                        skipped += 1
+                    message = f"S{season:02d}E{number:02d}: " + ("STRM criado." if outcome["added"] else "arquivo existente preservado.")
+        except Exception as exc:
+            failed += 1
+            logger.exception("Job %s failed on S%02dE%02d", job_id, season, number)
+            message = f"S{season:02d}E{number:02d}: falha ao processar."
+        update_job(job_id, completed=index, failed=failed + unavailable, message=message)
+
+    scan_result = "not_needed"
+    if added:
+        try:
+            await refresh_library()
+            scan_result = "requested"
+        except HTTPException as exc:
+            scan_result = f"failed: {exc.detail}"
+            logger.warning("Jellyfin library refresh failed for job %s: %s", job_id, exc.detail)
+    message = f"Concluido: {added} adicionados, {skipped} preservados, {unavailable} sem fonte, {failed} com erro."
+    if scan_result == "requested":
+        message += " Biblioteca Jellyfin atualizada."
+    elif scan_result.startswith("failed:"):
+        message += " Scan Jellyfin falhou; configure a chave no backend."
+    update_job(job_id, status="completed", completed=len(episodes), failed=failed + unavailable, message=message,
+               result={"added": added, "skipped": skipped, "unavailable": unavailable, "failed": failed, "jellyfin_scan": scan_result})
+
+
+async def _start_series_job(imdb_id: str, owner_id: str, kind: str, season_number: int | None = None) -> dict:
+    details = await get_metadata_details("series", imdb_id)
+    details["imdb_id"] = imdb_id
+    episodes = [episode for episode in details.get("episodes", []) if season_number is None or episode["season_number"] == season_number]
+    if not episodes:
+        raise HTTPException(status_code=404, detail="A metadata nao retornou episodios para essa selecao.")
+    job = create_job(kind, owner_id, total=len(episodes), message="Preparando episodios.")
+    start_task(_run_episode_job(job["id"], details, episodes, kind))
+    return {"job_id": job["id"], "status": job["status"], "total": job["total"]}
+
+
+@app.post("/api/library/add/series/{imdb_id}/season/{season}", status_code=202)
+async def add_season_job(
+    imdb_id: str,
+    request: Request,
+    season: int = PathParam(ge=0, le=99),
+    _: None = Depends(require_admin_mutation),
+) -> dict:
+    if not re.fullmatch(r"tt\d+", imdb_id):
+        raise HTTPException(status_code=422, detail="IMDb ID invalido.")
+    return await _start_series_job(imdb_id, request.state.user["user_id"], "add_season", season)
+
+
+@app.post("/api/library/add/series/{imdb_id}", status_code=202)
+async def add_full_series_job(
+    imdb_id: str,
+    request: Request,
+    _: None = Depends(require_admin_mutation),
+) -> dict:
+    if not re.fullmatch(r"tt\d+", imdb_id):
+        raise HTTPException(status_code=422, detail="IMDb ID invalido.")
+    return await _start_series_job(imdb_id, request.state.user["user_id"], "add_series")
+
+
+@app.post("/api/library/sync/series/{imdb_id}", status_code=202)
+async def sync_series_job(
+    imdb_id: str,
+    request: Request,
+    _: None = Depends(require_admin_mutation),
+) -> dict:
+    if not re.fullmatch(r"tt\d+", imdb_id):
+        raise HTTPException(status_code=422, detail="IMDb ID invalido.")
+    return await _start_series_job(imdb_id, request.state.user["user_id"], "sync_series")
+
+
+def _authorized_job(job_id: str, request: Request) -> dict:
+    job = get_job(job_id)
+    if job is None or not can_access_job(job, request.state.user):
+        raise HTTPException(status_code=404, detail="Job nao encontrado.")
+    return job
+
+
+@app.get("/api/jobs/{job_id}")
+async def read_job(job_id: str, request: Request, _: None = Depends(require_session)) -> dict:
+    return _authorized_job(job_id, request)
+
+
+@app.get("/api/jobs/{job_id}/events")
+async def job_events(job_id: str, request: Request, _: None = Depends(require_session)) -> StreamingResponse:
+    _authorized_job(job_id, request)
+
+    async def events():
+        while True:
+            job = _authorized_job(job_id, request)
+            yield f"data: {json.dumps(job, ensure_ascii=False)}\n\n"
+            if job["status"] in {"completed", "failed"}:
+                break
+            await asyncio.sleep(1)
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+ALLOWED_MEDIA_EXTENSIONS = {".mp4", ".mkv", ".webm"}
+
+
+async def _create_import_job(media_type: str, imdb_id: str, filename: str, size: int, owner_id: str, season: int | None = None, episode: int | None = None) -> dict:
+    if not re.fullmatch(r"tt\d+", imdb_id):
+        raise HTTPException(status_code=422, detail="IMDb ID invalido.")
+    extension = Path(filename).suffix.lower()
+    if extension not in ALLOWED_MEDIA_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Envie um arquivo MP4, MKV ou WEBM.")
+    if size > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"O limite de upload e {MAX_UPLOAD_BYTES // (1024 ** 3)} GB.")
+    if media_type == "series":
+        details = await get_metadata_details("series", imdb_id)
+        if not any(item["season_number"] == season and item["episode_number"] == episode for item in details.get("episodes", [])):
+            raise HTTPException(status_code=404, detail="Episodio nao encontrado na metadata.")
+    else:
+        await get_metadata_details("movie", imdb_id)
+    kind = "import_movie" if media_type == "movie" else "import_episode"
+    job = create_job(kind, owner_id, total=size, message="Aguardando envio do arquivo.")
+    update_job(job["id"], result={
+        "media_type": media_type,
+        "imdb_id": imdb_id,
+        "season": season,
+        "episode": episode,
+        "filename": Path(filename).name,
+        "size": size,
+    })
+    return {"job_id": job["id"], "status": "queued", "upload_url": f"/api/jobs/{job['id']}/upload"}
+
+
+@app.post("/api/jobs/import/movie/{imdb_id}", status_code=202)
+async def create_movie_import(imdb_id: str, payload: ImportJobPayload, request: Request, _: None = Depends(require_admin_mutation)) -> dict:
+    return await _create_import_job("movie", imdb_id, payload.filename, payload.size, request.state.user["user_id"])
+
+
+@app.post("/api/jobs/import/series/{imdb_id}/{season}/{episode}", status_code=202)
+async def create_episode_import(
+    imdb_id: str,
+    request: Request,
+    payload: ImportJobPayload,
+    season: int = PathParam(ge=0, le=99),
+    episode: int = PathParam(gt=0, le=999),
+    _: None = Depends(require_admin_mutation),
+) -> dict:
+    return await _create_import_job("series", imdb_id, payload.filename, payload.size, request.state.user["user_id"], season, episode)
+
+
+async def _finish_import(job_id: str, stage_path: Path) -> None:
+    job = get_job(job_id)
+    if job is None:
+        stage_path.unlink(missing_ok=True)
+        return
+    payload = job["result"]
+    try:
+        update_job(job_id, status="running", total=1, completed=0, message="Organizando o arquivo e verificando substituicoes.")
+        media_type = payload["media_type"]
+        imdb_id = payload["imdb_id"]
+        details = await get_metadata_details(media_type, imdb_id)
+        details["imdb_id"] = imdb_id
+        _save_metadata(details)
+        extension = Path(payload["filename"]).suffix.lower()
+        if media_type == "movie":
+            existing = scan_movie(MEDIA_ROOT, details["title"], details.get("year"))
+            if existing["status"] != "missing":
+                stage_path.unlink(missing_ok=True)
+                update_job(job_id, status="completed", completed=1, message="Arquivo existente preservado; nada foi sobrescrito.", result={"existing": existing["path"]})
+                return
+            folder = title_folder_name(details["title"], details.get("year"))
+            relative = Path(folder) / f"{_safe_name(folder)}{extension}"
+            item_id = f"movie:{imdb_id}"
+            item_title = details["title"]
+        else:
+            season = int(payload["season"])
+            episode = int(payload["episode"])
+            existing_status = scan_series(MEDIA_ROOT, details["title"], details.get("year"), details.get("year_end"), details.get("episodes", []))
+            existing = next((item for item in existing_status["episodes"] if item["season_number"] == season and item["episode_number"] == episode), None)
+            if existing and existing["status"] != "missing":
+                stage_path.unlink(missing_ok=True)
+                update_job(job_id, status="completed", completed=1, message="Arquivo existente preservado; nada foi sobrescrito.", result={"existing": existing["path"]})
+                return
+            selected = next((item for item in details["episodes"] if item["season_number"] == season and item["episode_number"] == episode), None)
+            if selected is None:
+                raise HTTPException(status_code=404, detail="Episodio nao encontrado na metadata.")
+            relative = _episode_strm_path(details, season, episode).with_suffix(extension)
+            item_id = _episode_item_id(imdb_id, season, episode)
+            item_title = selected["title"]
+
+        target = _media_path(relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(stage_path, target)
+        except FileExistsError:
+            stage_path.unlink(missing_ok=True)
+            update_job(job_id, status="completed", completed=1, message="Arquivo existente preservado; nada foi sobrescrito.", result={"existing": str(target)})
+            return
+        stage_path.unlink(missing_ok=True)
+        with SessionLocal() as session:
+            if session.get(LibraryItem, item_id) is None:
+                session.add(LibraryItem(id=item_id, media_type=media_type, imdb_id=imdb_id, title=item_title, path=str(target), stream_url="local"))
+                session.commit()
+        scan_message = "Arquivo importado."
+        scan_result = "not_configured"
+        try:
+            await refresh_library()
+            scan_message = "Arquivo importado. Biblioteca Jellyfin atualizada."
+            scan_result = "requested"
+        except HTTPException as exc:
+            scan_message += " Scan Jellyfin pendente: " + exc.detail
+            scan_result = f"failed: {exc.detail}"
+        update_job(job_id, status="completed", completed=1, message=scan_message, result={"path": str(target), "jellyfin_scan": scan_result})
+    except Exception as exc:
+        stage_path.unlink(missing_ok=True)
+        detail = exc.detail if isinstance(exc, HTTPException) else "Falha ao organizar arquivo importado."
+        logger.exception("Import job %s failed", job_id)
+        update_job(job_id, status="failed", message=detail, result={"error": detail})
+
+
+@app.put("/api/jobs/{job_id}/upload")
+async def upload_import_file(
+    job_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    _: None = Depends(require_admin_mutation),
+) -> dict:
+    job = _authorized_job(job_id, request)
+    if job["kind"] not in {"import_movie", "import_episode"} or job["status"] != "queued":
+        raise HTTPException(status_code=409, detail="Esse job nao esta aguardando upload.")
+    if Path(file.filename or "").suffix.lower() not in ALLOWED_MEDIA_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Envie um arquivo MP4, MKV ou WEBM.")
+    root = (Path(MEDIA_ROOT).resolve() / ".mlm-staging")
+    root.mkdir(parents=True, exist_ok=True)
+    stage_path = root / f"{job_id}.part"
+    written = 0
+    update_job(job_id, status="uploading", message="Recebendo arquivo.")
+    try:
+        with stage_path.open("xb") as output:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES or written > job["total"]:
+                    raise HTTPException(status_code=413, detail="O arquivo excede o tamanho informado ou o limite configurado.")
+                output.write(chunk)
+                if written == job["total"] or written % (5 * 1024 * 1024) < len(chunk):
+                    update_job(job_id, completed=written, message=f"Enviado {written // (1024 * 1024)} MB de {job['total'] // (1024 * 1024)} MB.")
+        if written != job["total"]:
+            raise HTTPException(status_code=422, detail="O tamanho enviado nao confere com o arquivo selecionado.")
+        update_job(job_id, status="running", total=1, completed=0, message="Upload recebido; organizando arquivo.")
+        start_task(_finish_import(job_id, stage_path))
+        return {"job_id": job_id, "status": "running"}
+    except Exception as exc:
+        stage_path.unlink(missing_ok=True)
+        detail = exc.detail if isinstance(exc, HTTPException) else "Falha ao receber arquivo."
+        update_job(job_id, status="failed", message=detail, result={"error": detail})
+        raise
+    finally:
+        await file.close()
 
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"

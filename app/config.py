@@ -16,7 +16,9 @@ FENIXFLIX_MANIFEST_URL = os.getenv(
     "FENIXFLIX_MANIFEST_URL",
     "https://fenixflix.fenixhub.online/qualities=4k,1080p,720p,sd%7Caudio=dublado,legendado%7Ccatalogs=populares_movie,populares_series,recentes_movie,recentes_series/manifest.json",
 ).strip()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://media.melhornegocio.shop").strip().rstrip("/")
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "/media/stream media").strip()
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024 * 1024)))
 JELLYFIN_URL = os.getenv("JELLYFIN_URL", "").strip().rstrip("/")
 JELLYFIN_API_KEY = os.getenv("JELLYFIN_API_KEY", "").strip()
 SESSION_SECRET = os.getenv("SESSION_SECRET", "").strip()

@@ -1,51 +1,51 @@
-# Media Library Manager
+﻿# Media Library Manager
 
-Aplicação FastAPI + React para pesquisar metadata, consultar addons Stremio e organizar arquivos `.strm` para Jellyfin.
+Aplicacao web para pesquisar filmes e series, consultar streams por protocolo Stremio e organizar arquivos locais ou `.strm` para uma biblioteca Jellyfin.
 
-## Coolify
+## Deploy no Coolify
 
-Use o Docker Compose do repositório e publique a porta interna `8000`. Mantenha o volume persistente `app_data` e configure no Coolify `JELLYFIN_URL`, `JELLYFIN_API_KEY` e `SESSION_SECRET` (segredo aleatório com pelo menos 32 caracteres). `COOKIE_SECURE=true` deve permanecer ligado atrás de HTTPS. O healthcheck é `GET /health`.
+O repositorio inclui `Dockerfile` multi-stage e `docker-compose.yml`. No Coolify, use a raiz `/` e o arquivo `/docker-compose.yml`; o servico escuta na porta interna `8000` e oferece `GET /health`.
 
-O Compose monta `/home/ubuntu/jellyfin/tvshows` em `/media`; os `.strm` são organizados em `/media/stream media`. A aplicação atende HTTP na porta interna `8000`. Para Cloudflare Tunnel, o host publica essa porta apenas em `127.0.0.1:8001`; configure a rota Tunnel para `http://localhost:8001`. O Compose não fixa arquitetura: o Coolify constrói para o host de destino.
+O Compose monta `/home/ubuntu/jellyfin/tvshows:/media`, e a biblioteca de destino fica em `/media/stream media`. SQLite e jobs ficam no volume persistente `app_data`. A imagem base Python e Node oferece ARM64; o Coolify compila para a arquitetura do host. Para escrita, o diretorio da biblioteca precisa conceder acesso ao UID `10001` do container.
 
-## Implementado
+Configure no Coolify `JELLYFIN_URL`, `JELLYFIN_API_KEY` e `SESSION_SECRET` (valor aleatorio, com pelo menos 32 caracteres). Mantenha esse segredo estavel: os links dos `.strm` dinamicos dependem dele. `PUBLIC_BASE_URL` deve ser o dominio HTTPS publico do app. `COOKIE_SECURE=true` funciona atras do proxy HTTPS do Coolify. Veja `.env.example` para as demais opcoes.
 
-- Busca de filmes e séries no Cinemeta, com IMDb IDs, poster, ano e sinopse.
-- Detalhes com elenco, temporadas e episódios.
-- Cliente Stremio que lê e valida o manifest antes de chamar `/stream/{type}/{videoID}.json`; respeita recursos, tipos e prefixos anunciados.
-- FrostStream primeiro e BestCine como fallback quando o primeiro não retorna URL HTTPS direta. Respostas P2P sem URL direta não viram `.strm`.
-- Login validado pelas contas e senhas do Jellyfin. A senha nao e armazenada; o token da resposta de autenticacao e descartado. Apenas administradores Jellyfin podem adicionar arquivos ou alterar addons.
-- Criação de `.strm` sem sobrescrever arquivo existente, com gravação sob `/media/stream media`.
-- SQLite persistente e imagem Docker multi-stage.
-- Tela administrativa para cadastrar manifests, inspecionar recursos/tipos/prefixos e ativar/desativar addons.
-- Prefer?ncias persistentes de provider e qualidade; a ordena??o prioriza dublado globalmente, depois legendado, qualidade preferida e provider.
-- Status local por filme/episodio detecta `.strm` e videos `.mp4`, `.mkv`, `.webm`; arquivos existentes sao preservados ao adicionar.
-- Apos criar um novo `.strm`, solicita scan pelo endpoint Jellyfin `POST /Library/Refresh`; `JELLYFIN_API_KEY` fica somente no backend.
+## Funcionalidades
 
-## API principal
+- Busca filmes e series em Cinemeta por IMDb ID, com poster, ano, sinopse, temporadas, episodios e elenco quando disponiveis.
+- Login com as credenciais do Jellyfin. O token de autenticacao nao e persistido. Apenas administradores podem mudar addons, preferencias ou arquivos da biblioteca.
+- Cadastro de Manifest URLs Stremio: leitura e validacao do manifest, resources, types e idPrefixes opcionais, seguida de chamadas aos endpoints JSON anunciados. O sistema nao faz scraping HTML nem tenta contornar protecoes externas.
+- Consulta dos addons ativos com prioridade de idioma dublado, depois legendado; preferencias de qualidade e provider controlam a ordem subsequente. FrostStream vem primeiro na consulta; os outros addons ativos funcionam como fallback.
+- Criacao de `.strm` dinamicos assinados. O Jellyfin acessa `/stream/...`, o backend consulta os addons novamente e redireciona para uma URL HTTPS direta. O proxy so e usado quando `behaviorHints.proxyHeaders` foi explicitamente fornecido pelo addon; headers `Range` sao encaminhados.
+- Importacao de `.mp4`, `.mkv` e `.webm` com limite configuravel (20 GB por padrao), progresso de upload e organizacao no formato de pastas Jellyfin.
+- Jobs persistentes com progresso por SSE para adicionar temporada/serie, sincronizar metadata e importar arquivos. A sincronizacao detecta arquivos existentes e nunca os substitui.
+- Verificacao de arquivos locais e `.strm`, protecao SSRF para hosts de addons/streams, validacao CSRF, cookies de sessao seguros e limite de requisicoes.
+- Ao criar/importar arquivos, solicita atualizacao da biblioteca Jellyfin usando uma API key mantida apenas no backend.
+
+## Endpoints principais
 
 - `GET /health`
-- `GET /api/search?query=Mr.%20Robot&media_type=series`
-- `GET /api/title/series/tt4158110` (requer sessao; inclui status local da biblioteca)
-- `GET /api/streams/series/tt4158110/1/1` (requer sessão)
-- `POST /api/library/add/series/tt4158110/1/1` (requer sessao de administrador, CSRF e `JELLYFIN_API_KEY` para solicitar scan)
-- `GET/POST/PATCH /api/addons` (requer sessao; alteracoes exigem sessao de administrador e CSRF)
-- `GET/PATCH /api/preferences` (requer sessao; alteracoes exigem administrador e CSRF)
-- Testes locais: `python -m unittest discover -s tests -v` (executar em ambiente com dependencias instaladas).
+- `GET /api/search?query=Mr.%20Robot&media_type=series` (requer sessao)
+- `GET /api/title/series/tt4158110` (requer sessao; metadata e estado local)
+- `GET /api/streams/series/tt4158110/1/1` (requer sessao)
+- `POST /api/library/add/series/tt4158110/1/1` (administrador + CSRF)
+- `POST /api/library/add/series/tt4158110/season/1` (job para temporada)
+- `POST /api/library/add/series/tt4158110` e `POST /api/library/sync/series/tt4158110` (jobs)
+- `POST /api/jobs/import/movie/{imdb_id}` / `POST /api/jobs/import/series/{imdb_id}/{season}/{episode}` e `PUT /api/jobs/{job_id}/upload` (administrador + CSRF)
+- `GET /api/jobs/{job_id}` e `GET /api/jobs/{job_id}/events` (sessao do dono ou administrador)
+- `GET /stream/movie/{imdb_id}` e `GET /stream/series/{imdb_id}/{season}/{episode}` (links assinados incluidos nos `.strm`)
 
-## Validação e limite atual
+## Validacao feita em 2026-10-07
 
-O escritor `.strm` foi testado isoladamente. O host Oracle confirmou ACL de escrita para UID 10001; a consulta de streams FrostStream retornou HTTP 403 tambem no host. Nao se usa User-Agent arbitrario nem se contornam bloqueios. O deploy, teste real de login Jellyfin e teste real de scan ainda dependem das variaveis configuradas no Coolify.
+Frontend TypeScript, imagem Docker e Compose foram validados localmente; 21 testes passaram em container Python 3.12. Os testes cobrem autenticacao Jellyfin, cliente de addons, links dinamicos, progresso de jobs, sincronizacao sem sobrescrever arquivos e importacao organizada.
 
+No site publicado, a busca por `Mr. Robot` retornou a serie de 2015 (`tt4158110`), quatro temporadas, 45 episodios, sinopse e elenco. A consulta ao S01E01 retornou uma fonte direta FenixFlix 1080p dublada. FrostStream e BestCine nao forneceram stream utilizavel no teste mais recente; o fallback FenixFlix funcionou. O PopPlay informado pelo usuario permanece indisponivel por falha de DNS, portanto nao foi adicionado como fonte funcional.
 
-### Verifica??o dos addons (2026-10-07)
+Os testes de upload usaram diretorios temporarios e nenhum arquivo foi adicionado a biblioteca de producao durante esta verificacao. Playback final e scan Jellyfin de um novo item dependem da `JELLYFIN_API_KEY` estar preenchida corretamente no Coolify.
 
-Teste feito pelo protocolo JSON Stremio para Mr. Robot S01E01 (`tt4158110:1:1`). FrostStream (`2.2.8`), BestCine (`13.0.0`) e FenixFlix (`1.2.0`) tiveram manifest v?lido e responderam ao endpoint `/stream/series/{videoID}.json` via cliente PowerShell. Os testes retornaram 5, 20 e 1 resultado, respectivamente. Amostras JSON (URLs omitidas):
+## Testes locais
 
-```json
-{"streams":[{"name":"FrostStream 1080p","title":"... Legendado"}]}
-{"streams":[{"name":"BestCine 720p","title":"... Dublado"}]}
-{"streams":[{"name":"FenixFlix 1080p","title":"... Dublado"}]}
+```sh
+docker compose build
+docker run --rm -v "$PWD:/workspace" -w /workspace -e PYTHONPATH=/workspace -e SESSION_SECRET=test-session-secret-value-at-least-32-characters -e DATABASE_URL=sqlite:////tmp/mlm-tests.sqlite3 --entrypoint python stremio_proprio-media-library-manager -m unittest discover -s tests -v
 ```
-
-No teste feito dentro da imagem Docker local (mesmo cliente HTTP usado pelo backend), FrostStream teve manifest HTTP 200 mas a rota de stream respondeu 403; BestCine respondeu 403 j? no manifest; FenixFlix respondeu HTTP 200 no manifest e na rota de stream, entregando 1 URL direta marcada como dublada. Nenhum User-Agent foi mascarado nem houve tentativa de contornar bloqueios. Isso confirma que FenixFlix est? tecnicamente consult?vel neste ambiente; a reprodu??o pelo Jellyfin ainda depende de validar o acesso no servidor Coolify. PopPlay n?o chegou ao manifest: o hostname comunit?rio testado (`site--popplay--rg2h4m5nr425.code.run`) falhou na resolu??o DNS. Ele pode ser cadastrado em Configura??es quando houver um Manifest URL acess?vel.

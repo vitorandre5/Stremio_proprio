@@ -5,6 +5,7 @@ import json
 import secrets
 import time
 from collections import defaultdict
+from threading import Lock
 
 from fastapi import Depends, Header, HTTPException, Request
 
@@ -15,6 +16,8 @@ SESSION_COOKIE = "mlm_session"
 CSRF_COOKIE = "mlm_csrf"
 SESSION_TTL = 7 * 24 * 60 * 60
 _login_attempts: dict[str, list[float]] = defaultdict(list)
+_request_attempts: dict[tuple[str, str], list[float]] = defaultdict(list)
+_rate_limit_lock = Lock()
 
 
 def _secret() -> bytes:
@@ -75,6 +78,24 @@ def record_login_attempt(client_ip: str, succeeded: bool) -> None:
         _login_attempts.pop(client_ip, None)
     else:
         _login_attempts[client_ip].append(time.time())
+
+
+def check_request_rate_limit(identity: str, scope: str, limit: int, window_seconds: int = 60) -> bool:
+    """Return whether a request may proceed, using a small in-memory sliding window."""
+    now = time.time()
+    key = (identity, scope)
+    with _rate_limit_lock:
+        attempts = [timestamp for timestamp in _request_attempts[key] if now - timestamp < window_seconds]
+        if len(attempts) >= limit:
+            _request_attempts[key] = attempts
+            return False
+        attempts.append(now)
+        _request_attempts[key] = attempts
+        if len(_request_attempts) > 10_000:
+            for old_key, values in list(_request_attempts.items()):
+                if not values or now - values[-1] >= window_seconds:
+                    _request_attempts.pop(old_key, None)
+        return True
 
 
 async def require_session(request: Request) -> None:

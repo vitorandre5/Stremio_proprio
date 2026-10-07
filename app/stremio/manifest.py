@@ -50,6 +50,7 @@ def supports(manifest: dict, resource_name: str, media_type: str, item_id: str) 
             prefixes = resource.get("idPrefixes") or root_prefixes
         else:
             continue
-        if media_type in resource_types and any(item_id.startswith(prefix) for prefix in prefixes if isinstance(prefix, str)):
+        valid_prefixes = [prefix for prefix in prefixes if isinstance(prefix, str) and prefix]
+        if media_type in resource_types and (not valid_prefixes or any(item_id.startswith(prefix) for prefix in valid_prefixes)):
             return True
     return False
