@@ -1,6 +1,9 @@
 services:
   media-library-manager:
     build: .
+    networks:
+      - default
+      - media-library-data
     expose:
       - "8000"
     # Origem HTTP local para o Cloudflare Tunnel, sem publicar na interface externa.
@@ -43,3 +46,9 @@ services:
 
 volumes:
   app_data:
+
+networks:
+  default:
+  media-library-data:
+    external: true
+    name: media-library-data
