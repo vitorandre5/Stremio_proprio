@@ -36,7 +36,7 @@ type TitleDetails = SearchResult & {
 };
 
 type StreamOption = { name: string; title: string; provider: string; quality: string | null; language: "dubbed" | "subtitled" | "portuguese_unspecified" | "unknown"; url: string };
-type TorrentOption = { name: string; title: string; provider: string; provider_id: string; quality: string | null; language: StreamOption["language"]; info_hash: string; file_idx: number | null };
+type TorrentOption = { name: string; title: string; provider: string; provider_id: string; quality: string | null; language: StreamOption["language"]; info_hash: string; file_idx: number | null; video_size?: number | null };
 type AddonResource = string | { name?: string; types?: string[]; idPrefixes?: string[] };
 type AddonItem = { id: string; name: string; manifest_url: string; enabled: boolean; manifest?: { resources?: AddonResource[]; types?: string[]; idPrefixes?: string[]; catalogs?: { id?: string; type?: string; name?: string; extra?: { name?: string }[] }[]; behaviorHints?: { p2p?: boolean } } | null };
 type Preferences = { preferred_quality: string; preferred_provider: string };
@@ -48,6 +48,11 @@ function manifestTypes(manifest: AddonItem["manifest"]) {
 
 function manifestPrefixes(manifest: AddonItem["manifest"]) {
   return Array.from(new Set([...(manifest?.idPrefixes || []), ...(manifest?.resources || []).flatMap((resource) => typeof resource === "string" ? [] : resource.idPrefixes || [])]));
+}
+
+function formatFileSize(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes < 0) return "Tamanho desconhecido";
+  return `${(bytes / (1024 ** 3)).toFixed(1)} GB`;
 }
 
 function streamLanguageLabel(language: StreamOption["language"]) {
@@ -112,7 +117,7 @@ export default function App() {
   const [settingsError, setSettingsError] = useState("");
   const [settingsMessage, setSettingsMessage] = useState("");
   const [authError, setAuthError] = useState("");
-  const [streamState, setStreamState] = useState<{ key: string; loading: boolean; streams: StreamOption[]; torrents: TorrentOption[]; error: string; saved: string }>({ key: "", loading: false, streams: [], torrents: [], error: "", saved: "" });
+  const [streamState, setStreamState] = useState<{ key: string; loading: boolean; streams: StreamOption[]; torrents: TorrentOption[]; max_torrent_bytes: number; error: string; saved: string }>({ key: "", loading: false, streams: [], torrents: [], max_torrent_bytes: 20 * 1024 ** 3, error: "", saved: "" });
   const [jobState, setJobState] = useState<JobSnapshot | null>(null);
   const jobEvents = useRef<EventSource | null>(null);
 
@@ -312,28 +317,28 @@ export default function App() {
 
   async function loadEpisodeStreams(episode: TitleDetails["episodes"][number]) {
     const key = `${episode.season_number}:${episode.episode_number}`;
-    setStreamState({ key, loading: true, streams: [], torrents: [], error: "", saved: "" });
+    setStreamState({ key, loading: true, streams: [], torrents: [], max_torrent_bytes: 20 * 1024 ** 3, error: "", saved: "" });
     try {
       const response = await fetch(`/api/streams/series/${details?.imdb_id}/${episode.season_number}/${episode.episode_number}`);
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Falha ao consultar os addons.");
       const addonErrors = (data.addon_errors || []).map((item: { provider: string; detail: string }) => `${item.provider}: ${item.detail}`).join(" · ");
-      setStreamState({ key, loading: false, streams: data.streams, torrents: data.torrents || [], error: data.streams.length || data.torrents?.length ? "" : addonErrors || "Nenhum stream ou torrent foi retornado pelos addons.", saved: "" });
+      setStreamState({ key, loading: false, streams: data.streams, torrents: data.torrents || [], max_torrent_bytes: data.max_torrent_bytes || 20 * 1024 ** 3, error: data.streams.length || data.torrents?.length ? "" : addonErrors || "Nenhum stream ou torrent foi retornado pelos addons.", saved: "" });
     } catch (cause) {
-      setStreamState({ key, loading: false, streams: [], torrents: [], error: cause instanceof Error ? cause.message : "Falha ao consultar os addons.", saved: "" });
+      setStreamState({ key, loading: false, streams: [], torrents: [], max_torrent_bytes: 20 * 1024 ** 3, error: cause instanceof Error ? cause.message : "Falha ao consultar os addons.", saved: "" });
     }
   }
 
   async function loadMovieStreams() {
-    setStreamState({ key: "movie", loading: true, streams: [], torrents: [], error: "", saved: "" });
+    setStreamState({ key: "movie", loading: true, streams: [], torrents: [], max_torrent_bytes: 20 * 1024 ** 3, error: "", saved: "" });
     try {
       const response = await fetch(`/api/streams/movie/${details?.imdb_id}`);
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Falha ao consultar os addons.");
       const addonErrors = (data.addon_errors || []).map((item: { provider: string; detail: string }) => `${item.provider}: ${item.detail}`).join(" · ");
-      setStreamState({ key: "movie", loading: false, streams: data.streams, torrents: data.torrents || [], error: data.streams.length || data.torrents?.length ? "" : addonErrors || "Nenhum stream ou torrent foi retornado pelos addons.", saved: "" });
+      setStreamState({ key: "movie", loading: false, streams: data.streams, torrents: data.torrents || [], max_torrent_bytes: data.max_torrent_bytes || 20 * 1024 ** 3, error: data.streams.length || data.torrents?.length ? "" : addonErrors || "Nenhum stream ou torrent foi retornado pelos addons.", saved: "" });
     } catch (cause) {
-      setStreamState({ key: "movie", loading: false, streams: [], torrents: [], error: cause instanceof Error ? cause.message : "Falha ao consultar os addons.", saved: "" });
+      setStreamState({ key: "movie", loading: false, streams: [], torrents: [], max_torrent_bytes: 20 * 1024 ** 3, error: cause instanceof Error ? cause.message : "Falha ao consultar os addons.", saved: "" });
     }
   }
 
@@ -364,6 +369,23 @@ export default function App() {
       watchJob(data.job_id);
     } catch (cause) {
       setStreamState((current) => ({ ...current, key: "movie", error: cause instanceof Error ? cause.message : "Falha ao iniciar o download." }));
+    }
+  }
+
+  async function downloadEpisodeTorrent(episode: TitleDetails["episodes"][number], stream: TorrentOption) {
+    setJobState(null);
+    try {
+      const response = await fetch(`/api/jobs/download/series/${details?.imdb_id}/${episode.season_number}/${episode.episode_number}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+        body: JSON.stringify({ info_hash: stream.info_hash, provider_id: stream.provider_id, file_idx: stream.file_idx }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Nao foi possivel iniciar o download.");
+      setJobState({ id: data.job_id, kind: "torrent_download", status: "queued", total: 1, completed: 0, failed: 0, message: "Download do episodio iniciado.", result: {} });
+      watchJob(data.job_id);
+    } catch (cause) {
+      setStreamState((current) => ({ ...current, error: cause instanceof Error ? cause.message : "Falha ao iniciar o download." }));
     }
   }
 
@@ -603,7 +625,7 @@ export default function App() {
                 <div className="addon-card-head"><div><strong>{addon.name}</strong><small>{addon.id}</small></div><button className={`filter-chip ${addon.enabled ? "active" : ""}`} type="button" onClick={() => void toggleAddon(addon)}>{addon.enabled ? "Ativo" : "Desativado"}</button></div>
                 <a href={addon.manifest_url} target="_blank" rel="noreferrer">{addon.manifest_url}</a>
                 {addon.manifest && <div className="manifest-facts"><span>Resources: {(addon.manifest.resources || []).map((resource) => typeof resource === "string" ? resource : resource.name || "resource").join(", ") || "-"}</span><span>Types: {manifestTypes(addon.manifest).join(", ") || "-"}</span><span>ID prefixes: {manifestPrefixes(addon.manifest).join(", ") || "all"}</span><span>Catálogos com busca: {(addon.manifest.catalogs || []).filter((catalog) => catalog.extra?.some((extra) => extra.name === "search")).map((catalog) => `${catalog.name || catalog.id} (${catalog.type})`).join(", ") || "nenhum declarado"}</span></div>}
-                {addon.manifest?.behaviorHints?.p2p && <p className="addon-capability-warning">Este addon declara streams P2P; esta aplicação aceita apenas URLs diretas HTTPS.</p>}
+                {addon.manifest?.behaviorHints?.p2p && <p className="addon-capability-warning">Este addon oferece P2P. Opções com infoHash podem ser baixadas para o servidor, limitadas a 20 GB e removidas automaticamente em até 8 horas.</p>}
               </article>)}
               <form className="settings-form" onSubmit={handleAddonSubmit}><h3>Adicionar addon</h3><label>Nome<input value={addonName} onChange={(event) => setAddonName(event.target.value)} maxLength={120} required /></label><label>Manifest URL<input type="url" value={manifestUrl} onChange={(event) => setManifestUrl(event.target.value)} placeholder="https://addon.example/manifest.json" required /></label><button type="submit" disabled={!addonName.trim() || !manifestUrl.trim()}>Validar e cadastrar</button></form>
             </section>
@@ -692,7 +714,7 @@ export default function App() {
                 <div className="detail-body">
                   {jobState && <div className={`message job-progress ${jobState.status === "failed" ? "error-message" : ""}`} aria-live="polite"><div><strong>{jobState.message}</strong><span>{jobState.total ? `${jobState.completed.toLocaleString()} / ${jobState.total.toLocaleString()}` : jobState.status}</span></div>{jobState.total > 0 && <progress max={jobState.total} value={Math.min(jobState.completed, jobState.total)} />}</div>}
                   <div className="detail-block"><h3>Sinopse</h3><p>{details.overview || "Sinopse indisponível para este título."}</p></div>
-                  {details.media_type === "movie" && <div className="detail-block movie-add-block"><h3>Biblioteca</h3><p className={`library-state ${linkCheckLabel({ status: details.library_status?.status || "missing", link_check: details.library_status?.link_check }).state}`}>{linkCheckLabel({ status: details.library_status?.status || "missing", link_check: details.library_status?.link_check }).label}</p>{details.library_status?.link_check?.checked_at && <small>Verificado em {new Date(details.library_status.link_check.checked_at).toLocaleString()}</small>}{details.library_status?.path && <small>{details.library_status.path}</small>}<button className="episode-action" type="button" onClick={() => void loadMovieStreams()}>Consultar addons</button>{isAdmin && <label className="episode-action upload-action">Importar arquivo local<input type="file" accept=".mp4,.mkv,.webm,video/mp4,video/x-matroska,video/webm" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file && details.imdb_id) void startImport(`/api/jobs/import/movie/${details.imdb_id}`, file); }} /></label>}{streamState.key === "movie" && <div className="stream-results">{streamState.loading && <p>Consultando addons...</p>}{streamState.error && <p className="error-message">{streamState.error}</p>}{streamState.saved && <p className="success-message">{streamState.saved}</p>}{streamState.streams.map((stream) => <div className="stream-option" key={`${stream.provider}-${stream.url}`}><div><strong>{stream.provider} · {streamLanguageLabel(stream.language)}</strong><span>{stream.quality || stream.name}</span><small>{stream.title}</small></div>{isAdmin && <button type="button" onClick={() => void addMovieStream(stream)}>Adicionar</button>}</div>)}{streamState.torrents.map((stream) => <div className="stream-option" key={`${stream.provider}-${stream.info_hash}`}><div><strong>{stream.provider} · Torrent</strong><span>{stream.quality || stream.name} · {streamLanguageLabel(stream.language)}</span><small>{stream.title}</small></div>{isAdmin && <button type="button" onClick={() => void downloadMovieTorrent(stream)}>Baixar temporariamente</button>}</div>)}{streamState.torrents.length > 0 && <small>O arquivo temporário será excluído depois que o Jellyfin marcar o filme como reproduzido.</small>}</div>}</div>}
+                  {details.media_type === "movie" && <div className="detail-block movie-add-block"><h3>Biblioteca</h3><p className={`library-state ${linkCheckLabel({ status: details.library_status?.status || "missing", link_check: details.library_status?.link_check }).state}`}>{linkCheckLabel({ status: details.library_status?.status || "missing", link_check: details.library_status?.link_check }).label}</p>{details.library_status?.link_check?.checked_at && <small>Verificado em {new Date(details.library_status.link_check.checked_at).toLocaleString()}</small>}{details.library_status?.path && <small>{details.library_status.path}</small>}<button className="episode-action" type="button" onClick={() => void loadMovieStreams()}>Consultar addons</button>{isAdmin && <label className="episode-action upload-action">Importar arquivo local<input type="file" accept=".mp4,.mkv,.webm,video/mp4,video/x-matroska,video/webm" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file && details.imdb_id) void startImport(`/api/jobs/import/movie/${details.imdb_id}`, file); }} /></label>}{streamState.key === "movie" && <div className="stream-results">{streamState.loading && <p>Consultando addons...</p>}{streamState.error && <p className="error-message">{streamState.error}</p>}{streamState.saved && <p className="success-message">{streamState.saved}</p>}{streamState.streams.map((stream) => <div className="stream-option" key={`${stream.provider}-${stream.url}`}><div><strong>{stream.provider} · {streamLanguageLabel(stream.language)}</strong><span>{stream.quality || stream.name}</span><small>{stream.title}</small></div>{isAdmin && <button type="button" onClick={() => void addMovieStream(stream)}>Adicionar</button>}</div>)}{streamState.torrents.map((stream) => <div className="stream-option" key={`${stream.provider}-${stream.info_hash}-${stream.file_idx}`}><div><strong>{stream.provider} · Torrent</strong><span>{stream.quality || stream.name} · {streamLanguageLabel(stream.language)} · {stream.video_size != null ? formatFileSize(stream.video_size) : "Tamanho validado ao iniciar"}</span><small>{stream.title}</small></div>{isAdmin && <button type="button" disabled={stream.video_size != null && stream.video_size > streamState.max_torrent_bytes} title={stream.video_size != null && stream.video_size > streamState.max_torrent_bytes ? "Arquivo acima do limite de 20 GB" : undefined} onClick={() => void downloadMovieTorrent(stream)}>{stream.video_size != null && stream.video_size > streamState.max_torrent_bytes ? "Acima de 20 GB" : "Baixar temporariamente"}</button>}</div>)}{streamState.torrents.length > 0 && <small>Limite de 20 GB por arquivo. O torrent será removido em até 8 horas após o download; se estiver em reprodução, a limpeza aguarda o fim.</small>}</div>}</div>}
                   {details.media_type === "series" && details.seasons && (
                     <div className="detail-block season-summary">
                       <div><h3>Temporadas</h3><span>{details.season_count ?? details.seasons.length} temporadas · {details.episode_count ?? "?"} episódios</span></div>
@@ -718,6 +740,8 @@ export default function App() {
                                   {streamState.error && <p className="error-message">{streamState.error}</p>}
                                   {streamState.saved && <p className="success-message">{streamState.saved}</p>}
                                   {streamState.streams.map((stream) => <div className="stream-option" key={`${stream.provider}-${stream.url}`}><div><strong>{stream.provider} · {streamLanguageLabel(stream.language)}</strong><span>{stream.quality || stream.name}</span><small>{stream.title}</small></div>{isAdmin && <button type="button" onClick={() => { const episode = details.episodes.find((item) => `${item.season_number}:${item.episode_number}` === streamState.key); if (episode) void addEpisodeStream(episode, stream); }}>Adicionar</button>}</div>)}
+                                  {streamState.torrents.map((stream) => <div className="stream-option" key={`${stream.provider}-${stream.info_hash}-${stream.file_idx}`}><div><strong>{stream.provider} · Torrent</strong><span>{stream.quality || stream.name} · {stream.video_size != null ? formatFileSize(stream.video_size) : "Tamanho validado ao iniciar"}</span><small>{stream.title}</small></div>{isAdmin && <button type="button" disabled={stream.video_size != null && stream.video_size > streamState.max_torrent_bytes} title={stream.video_size != null && stream.video_size > streamState.max_torrent_bytes ? "Arquivo acima do limite de 20 GB" : undefined} onClick={() => { const episode = details.episodes.find((item) => `${item.season_number}:${item.episode_number}` === streamState.key); if (episode) void downloadEpisodeTorrent(episode, stream); }}>{stream.video_size != null && stream.video_size > streamState.max_torrent_bytes ? "Acima de 20 GB" : "Baixar temporariamente"}</button>}</div>)}
+                                  {streamState.torrents.length > 0 && <small>Limite de 20 GB por arquivo; remoção automática em até 8 horas após o download.</small>}
                                 </div>}
                               </div>}
                             </div>

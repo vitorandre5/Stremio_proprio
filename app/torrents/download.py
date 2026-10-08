@@ -24,7 +24,7 @@ async def download_movie(info_hash: str, staging_dir: Path, max_bytes: int, repo
     )
     try:
         while process.returncode is None:
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.5)
             size = sum(path.stat().st_size for path in staging_dir.rglob("*") if path.is_file())
             if size > max_bytes:
                 process.kill()

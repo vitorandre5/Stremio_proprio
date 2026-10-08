@@ -13,14 +13,18 @@ def torrent_urls(streams: list[dict]) -> list[dict]:
         if not isinstance(info_hash, str) or not (len(info_hash) == 40 and all(c in "0123456789abcdefABCDEF" for c in info_hash)):
             continue
         info_hash = info_hash.lower()
-        if info_hash in seen:
+        file_idx = stream.get("fileIdx") if isinstance(stream.get("fileIdx"), int) and not isinstance(stream.get("fileIdx"), bool) and stream.get("fileIdx") >= 0 else None
+        key = (info_hash, file_idx)
+        if key in seen:
             continue
-        seen.add(info_hash)
+        seen.add(key)
+        video_size = stream.get("videoSize")
         results.append({
             "name": stream.get("name") or "Torrent",
             "title": stream.get("description") or stream.get("title") or stream.get("name") or "Torrent",
             "info_hash": info_hash,
-            "file_idx": stream.get("fileIdx") if isinstance(stream.get("fileIdx"), int) and stream.get("fileIdx") >= 0 else None,
+            "file_idx": file_idx,
+            "video_size": video_size if isinstance(video_size, int) and not isinstance(video_size, bool) and video_size >= 0 else None,
             "quality": _quality(stream),
             "language": _language(stream),
         })
@@ -70,9 +74,10 @@ async def find_direct_streams(addons: list[dict], media_type: str, video_id: str
             seen_urls.add(stream["url"])
             streams.append({**stream, "provider": addon["name"], "provider_id": addon["id"]})
         for stream in torrent_urls(response):
-            if stream["info_hash"] in seen_torrents:
+            torrent_key = (stream["info_hash"], stream["file_idx"])
+            if torrent_key in seen_torrents:
                 continue
-            seen_torrents.add(stream["info_hash"])
+            seen_torrents.add(torrent_key)
             torrents.append({**stream, "provider": addon["name"], "provider_id": addon["id"]})
     return {"streams": streams, "torrents": torrents, "addon_errors": errors}
 

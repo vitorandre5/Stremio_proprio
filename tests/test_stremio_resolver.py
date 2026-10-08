@@ -20,12 +20,16 @@ class StreamLanguageTests(unittest.TestCase):
 
     def test_torrent_stream_requires_a_valid_info_hash_and_keeps_file_index(self):
         parsed = torrent_urls([
-            {"infoHash": "A" * 40, "fileIdx": 0, "name": "1080p Dublado"},
+            {"infoHash": "A" * 40, "fileIdx": 0, "videoSize": 1073741824, "name": "1080p Dublado"},
+            {"infoHash": "A" * 40, "fileIdx": 1, "videoSize": 22 * 1024 ** 3, "name": "Extra file"},
             {"infoHash": "malicious", "url": "https://8.8.8.8/video.mkv"},
         ])
-        self.assertEqual(len(parsed), 1)
+        self.assertEqual(len(parsed), 2)
         self.assertEqual(parsed[0]["info_hash"], "a" * 40)
         self.assertEqual(parsed[0]["file_idx"], 0)
+        self.assertEqual(parsed[0]["video_size"], 1073741824)
+        self.assertEqual(parsed[1]["file_idx"], 1)
+        self.assertEqual(parsed[1]["video_size"], 22 * 1024 ** 3)
         self.assertEqual(parsed[0]["language"], "dubbed")
 
 
@@ -37,16 +41,18 @@ class ResolverTests(unittest.IsolatedAsyncioTestCase):
         ]
         shared = {"url": "https://8.8.8.8/shared", "title": "Dublado", "name": "720p"}
         torrent = {"infoHash": "a" * 40, "title": "Torrent dublado", "fileIdx": 0}
+        second_file = {"infoHash": "a" * 40, "title": "Outro episódio do mesmo pacote", "fileIdx": 1}
         unique = {"url": "https://8.8.8.8/unique", "title": "Legendado", "name": "1080p"}
 
-        with patch("app.stremio.resolver.request_streams", new=AsyncMock(side_effect=[[shared, torrent], [shared, unique, torrent]])) as request:
+        with patch("app.stremio.resolver.request_streams", new=AsyncMock(side_effect=[[shared, torrent], [shared, unique, torrent, second_file]])) as request:
             result = await find_direct_streams(addons, "series", "tt4158110:1:1")
 
         self.assertEqual(request.await_count, 2)
         self.assertEqual([stream["url"] for stream in result["streams"]], [shared["url"], unique["url"]])
         self.assertEqual([stream["provider"] for stream in result["streams"]], ["FrostStream", "FenixFlix"])
-        self.assertEqual(len(result["torrents"]), 1)
+        self.assertEqual(len(result["torrents"]), 2)
         self.assertEqual(result["torrents"][0]["provider"], "FrostStream")
+        self.assertEqual([stream["file_idx"] for stream in result["torrents"]], [0, 1])
 
 
 class StreamOrderingTests(unittest.TestCase):

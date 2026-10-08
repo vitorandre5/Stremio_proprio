@@ -19,7 +19,7 @@ from typing import Literal
 
 from app.database.db import Base, SessionLocal, engine
 from app.database.models import Addon, Job, LibraryItem, LinkCheck, MetadataItem, Preference, TemporaryMedia
-from app.jellyfin.client import authenticate_user, item_image as get_jellyfin_item_image, item_marked_played, playback_sessions, refresh_library, resume_items as get_resume_items, user_item as get_jellyfin_user_item, watched_media as get_watched_media
+from app.jellyfin.client import authenticate_user, item_image as get_jellyfin_item_image, playback_sessions, refresh_library, resume_items as get_resume_items, user_item as get_jellyfin_user_item, watched_media as get_watched_media
 from app.library.dynamic import dynamic_signature, dynamic_strm_url, verify_dynamic_signature
 from app.library.service import scan_movie, scan_series, series_folder_name, title_folder_name
 from app.config import BESTCINE_MANIFEST_URL, BRAZUCA_TORRENTS_MANIFEST_URL, COOKIE_SECURE, FENIXFLIX_MANIFEST_URL, FROST_MANIFEST_URL, JELLYFIN_API_KEY, JELLYFIN_URL, LINK_CHECK_INTERVAL_SECONDS, MAX_TORRENT_BYTES, MAX_UPLOAD_BYTES, MEDIA_ROOT, TMDB_API_TOKEN
@@ -51,14 +51,17 @@ from app.torrents.download import download_movie
 
 logger = logging.getLogger("media_library_manager")
 _SEARCH_AVAILABILITY_CACHE: dict[str, tuple[float, str, list[str]]] = {}
+TORRENT_RETENTION_SECONDS = 8 * 60 * 60
 
 
-async def check_temporary_media_playback() -> None:
+async def check_temporary_media_playback(now: float | None = None) -> None:
     sessions = await playback_sessions()
+    now = now if now is not None else time.time()
     with SessionLocal() as session:
         records = [
             {"info_hash": item.info_hash, "path": item.path, "playback_started": item.playback_started,
-             "jellyfin_item_id": item.jellyfin_item_id, "jellyfin_user_id": item.jellyfin_user_id}
+             "jellyfin_item_id": item.jellyfin_item_id, "jellyfin_user_id": item.jellyfin_user_id,
+             "downloaded_at": item.downloaded_at}
             for item in session.query(TemporaryMedia).filter(TemporaryMedia.status == "downloaded").all()
         ]
     for record in records:
@@ -78,9 +81,8 @@ async def check_temporary_media_playback() -> None:
                         current.jellyfin_user_id = user_id
                         session.commit()
             continue
-        if not record["playback_started"] or not record["jellyfin_item_id"] or not record["jellyfin_user_id"]:
-            continue
-        if not await item_marked_played(record["jellyfin_user_id"], record["jellyfin_item_id"]):
+        downloaded_at = record["downloaded_at"]
+        if not isinstance(downloaded_at, (float, int)) or now - downloaded_at < TORRENT_RETENTION_SECONDS:
             continue
         root = Path(MEDIA_ROOT).resolve()
         media_path = Path(record["path"]).resolve()
@@ -136,6 +138,11 @@ async def lifespan(_: FastAPI):
     if "provider_id" not in check_columns:
         with engine.begin() as connection:
             connection.execute(text("ALTER TABLE link_checks ADD COLUMN provider_id VARCHAR(160)"))
+    temporary_columns = {column["name"] for column in inspect(engine).get_columns("temporary_media")}
+    if "downloaded_at" not in temporary_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE temporary_media ADD COLUMN downloaded_at FLOAT"))
+            connection.execute(text("UPDATE temporary_media SET downloaded_at = :now WHERE downloaded_at IS NULL"), {"now": time.time()})
     mark_interrupted_jobs()
     clear_interrupted_torrent_staging()
     with SessionLocal() as session:
@@ -647,6 +654,7 @@ async def _streams_for(media_type: str, video_id: str, preferred_provider_overri
     result = await find_direct_streams(config, media_type, video_id)
     sort_streams(result["streams"], config, preferred_quality)
     sort_torrents(result.get("torrents", []), config, preferred_quality)
+    result["max_torrent_bytes"] = MAX_TORRENT_BYTES
     return result
 
 @app.get("/api/streams/movie/{imdb_id}")
@@ -822,14 +830,28 @@ async def add_episode(
     return result
 
 
-async def _run_torrent_download(job_id: str, imdb_id: str, details: dict, selected: dict) -> None:
+def _temporary_torrent_key(selected: dict) -> str:
+    info_hash = selected["info_hash"]
+    file_idx = selected.get("file_idx")
+    return f"{info_hash}:{file_idx}" if isinstance(file_idx, int) else info_hash
+
+
+async def _run_torrent_download(
+    job_id: str,
+    media_type: str,
+    imdb_id: str,
+    details: dict,
+    selected: dict,
+    season: int | None = None,
+    episode: int | None = None,
+) -> None:
     media_root = Path(MEDIA_ROOT).resolve()
     staging_root = media_root / ".mlm-torrents"
     staging_path = staging_root / job_id
     staged_file = None
     published_file = None
     try:
-        update_job(job_id, status="running", total=1, completed=0, failed=0, message="Baixando torrent autorizado em pasta temporaria.")
+        update_job(job_id, status="running", total=1, completed=0, failed=0, message="Baixando torrent em pasta temporaria; limite de 20 GB.")
         last_report = 0.0
         last_bytes = -1
 
@@ -841,33 +863,47 @@ async def _run_torrent_download(job_id: str, imdb_id: str, details: dict, select
                 last_report, last_bytes = now, byte_count
 
         staged_file = await download_movie(selected["info_hash"], staging_path, MAX_TORRENT_BYTES, report, selected.get("file_idx"))
-        folder_name = title_folder_name(details["title"], details.get("year"))
-        relative = Path(folder_name) / f"{folder_name}{staged_file.suffix.lower()}"
+        if media_type == "movie":
+            folder_name = title_folder_name(details["title"], details.get("year"))
+            relative = Path(folder_name) / f"{folder_name}{staged_file.suffix.lower()}"
+            item_id = f"movie:{imdb_id}"
+            library_type = "movie"
+            media_title = details["title"]
+        else:
+            if season is None or episode is None:
+                raise RuntimeError("Temporada e episódio são necessários para organizar este torrent.")
+            episode_details = next((item for item in details.get("episodes", []) if item["season_number"] == season and item["episode_number"] == episode), None)
+            if episode_details is None:
+                raise RuntimeError("O episódio não foi encontrado na metadata atualizada.")
+            relative = _episode_strm_path(details, season, episode).with_suffix(staged_file.suffix.lower())
+            item_id = f"series:{imdb_id}:{season}:{episode}"
+            library_type = "series"
+            media_title = episode_details["title"]
         published_file = _media_path(relative)
         published_file.parent.mkdir(parents=True, exist_ok=True)
         os.link(staged_file, published_file)
-        item_id = f"movie:{imdb_id}"
+        torrent_key = _temporary_torrent_key(selected)
         with SessionLocal() as session:
-            tracked = session.get(TemporaryMedia, selected["info_hash"])
+            tracked = session.get(TemporaryMedia, torrent_key)
             if tracked is not None:
                 raise RuntimeError("Este torrent ja esta cadastrado como midia temporaria.")
             library_item = session.get(LibraryItem, item_id)
             if library_item is None:
-                library_item = LibraryItem(id=item_id, media_type="movie", imdb_id=imdb_id, title=details["title"], path=str(published_file), stream_url=f"torrent:{selected['info_hash']}")
+                library_item = LibraryItem(id=item_id, media_type=library_type, imdb_id=imdb_id, title=media_title, path=str(published_file), stream_url=f"torrent:{selected['info_hash']}")
                 session.add(library_item)
             else:
                 library_item.path = str(published_file)
                 library_item.stream_url = f"torrent:{selected['info_hash']}"
-            session.add(TemporaryMedia(info_hash=selected["info_hash"], imdb_id=imdb_id, title=details["title"], path=str(published_file)))
+            session.add(TemporaryMedia(info_hash=torrent_key, imdb_id=imdb_id, title=media_title, path=str(published_file), downloaded_at=time.time()))
             session.commit()
         try:
             await refresh_library()
-            scan_message = "Download concluido. Jellyfin atualizado; o arquivo sera removido quando o Jellyfin marcar o filme como reproduzido."
+            scan_message = "Download concluido. Jellyfin atualizado; o arquivo temporario sera excluido em ate 8 horas."
             scan_state = "requested"
         except HTTPException as exc:
             scan_message = f"Download concluido, mas a atualizacao Jellyfin falhou: {exc.detail}"
             scan_state = "failed"
-        update_job(job_id, status="completed", total=1, completed=1, message=scan_message, result={"path": str(published_file), "temporary": True, "delete_when_played": True, "jellyfin_scan": scan_state})
+        update_job(job_id, status="completed", total=1, completed=1, message=scan_message, result={"path": str(published_file), "temporary": True, "retention_seconds": TORRENT_RETENTION_SECONDS, "jellyfin_scan": scan_state})
     except Exception as exc:
         logger.exception("Torrent download job %s failed", job_id)
         if published_file is not None:
@@ -903,12 +939,48 @@ async def download_movie_job(
         if errors:
             detail += " " + errors
         raise HTTPException(status_code=409, detail=detail)
+    if torrent.get("video_size") is not None and torrent["video_size"] > MAX_TORRENT_BYTES:
+        raise HTTPException(status_code=413, detail="Este arquivo torrent ultrapassa o limite de 20 GB.")
     with SessionLocal() as session:
-        if session.get(TemporaryMedia, torrent["info_hash"]):
+        if session.get(TemporaryMedia, _temporary_torrent_key(torrent)):
             raise HTTPException(status_code=409, detail="Este torrent ja esta sendo mantido como arquivo temporario.")
     user = session_user(request.cookies.get(SESSION_COOKIE)) or {}
     job = create_job("torrent_download", user.get("user_id", ""), total=1, message="Preparando download torrent.")
-    start_task(_run_torrent_download(job["id"], imdb_id, details, torrent))
+    start_task(_run_torrent_download(job["id"], "movie", imdb_id, details, torrent))
+    return {"job_id": job["id"], "status": "queued"}
+
+
+@app.post("/api/jobs/download/series/{imdb_id}/{season}/{episode}", status_code=202)
+async def download_episode_torrent_job(
+    request: Request,
+    imdb_id: str,
+    choice: TorrentChoice,
+    season: int = PathParam(ge=0, le=99),
+    episode: int = PathParam(gt=0, le=999),
+    _: None = Depends(require_admin_mutation),
+) -> dict:
+    if not re.fullmatch(r"tt\d+", imdb_id):
+        raise HTTPException(status_code=422, detail="IMDb ID invalido.")
+    details = await get_metadata_details("series", imdb_id)
+    selected_episode = next((item for item in details.get("episodes", []) if item["season_number"] == season and item["episode_number"] == episode), None)
+    if selected_episode is None:
+        raise HTTPException(status_code=404, detail="Episodio nao encontrado na metadata.")
+    existing = scan_series(MEDIA_ROOT, details["title"], details.get("year"), details.get("year_end"), details.get("episodes", []))
+    existing_episode = next((item for item in existing["episodes"] if item["season_number"] == season and item["episode_number"] == episode), None)
+    if existing_episode and existing_episode["status"] != "missing":
+        raise HTTPException(status_code=409, detail="Ja existe um arquivo para este episodio; nada foi sobrescrito.")
+    streams = await _streams_for("series", f"{imdb_id}:{season}:{episode}")
+    torrent = next((item for item in streams.get("torrents", []) if item["info_hash"] == choice.info_hash.lower() and item["provider_id"] == choice.provider_id and item.get("file_idx") == choice.file_idx), None)
+    if torrent is None:
+        raise HTTPException(status_code=409, detail="O torrent selecionado nao aparece mais na resposta atual do addon.")
+    if torrent.get("video_size") is not None and torrent["video_size"] > MAX_TORRENT_BYTES:
+        raise HTTPException(status_code=413, detail="Este arquivo torrent ultrapassa o limite de 20 GB.")
+    with SessionLocal() as session:
+        if session.get(TemporaryMedia, _temporary_torrent_key(torrent)):
+            raise HTTPException(status_code=409, detail="Este torrent ja esta cadastrado como arquivo temporario.")
+    user = session_user(request.cookies.get(SESSION_COOKIE)) or {}
+    job = create_job("torrent_download", user.get("user_id", ""), total=1, message="Preparando download do episodio por torrent.")
+    start_task(_run_torrent_download(job["id"], "series", imdb_id, details, torrent, season, episode))
     return {"job_id": job["id"], "status": "queued"}
 
 

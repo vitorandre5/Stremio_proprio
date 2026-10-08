@@ -13,14 +13,21 @@ from app.jobs.manager import create_job, get_job, update_job
 from app.library import dynamic
 from app.database.db import Base, SessionLocal, engine
 from app.database.models import LibraryItem, TemporaryMedia
-from app.main import _episode_strm_path, _merge_search_results, _rank_search_results, _run_episode_job, app, check_temporary_media_playback
+from app.main import TORRENT_RETENTION_SECONDS, _episode_strm_path, _merge_search_results, _rank_search_results, _run_episode_job, _temporary_torrent_key, app, check_temporary_media_playback
 from app.stremio.manifest import supports
 from app.security import check_request_rate_limit
 from fastapi.testclient import TestClient
 
 
 class NewFunctionalityTests(unittest.TestCase):
-    def test_torrent_file_is_removed_only_after_jellyfin_marks_played_and_session_ends(self):
+    def test_torrent_tracking_allows_different_episode_files_from_the_same_pack(self):
+        first = _temporary_torrent_key({"info_hash": "a" * 40, "file_idx": 2})
+        second = _temporary_torrent_key({"info_hash": "a" * 40, "file_idx": 3})
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(first, "a" * 40 + ":2")
+
+    def test_torrent_file_expires_after_eight_hours_and_waits_for_active_playback_to_end(self):
         Base.metadata.create_all(bind=engine)
         info_hash = "c" * 40
         user_id = "a1a1a1a1-1111-4111-8111-111111111111"
@@ -32,19 +39,18 @@ class NewFunctionalityTests(unittest.TestCase):
             with SessionLocal() as session:
                 session.query(TemporaryMedia).filter_by(info_hash=info_hash).delete()
                 session.query(LibraryItem).filter_by(id="movie:tt0123000").delete()
-                session.add(TemporaryMedia(info_hash=info_hash, imdb_id="tt0123000", title="Public Film", path=str(media), status="downloaded"))
+                session.add(TemporaryMedia(info_hash=info_hash, imdb_id="tt0123000", title="Public Film", path=str(media), status="downloaded", downloaded_at=1000))
                 session.add(LibraryItem(id="movie:tt0123000", media_type="movie", imdb_id="tt0123000", title="Public Film", path=str(media), stream_url=f"torrent:{info_hash}"))
                 session.commit()
             active_session = {"UserId": user_id, "PlayState": {"IsPaused": False}, "NowPlayingItem": {"Id": jellyfin_item_id, "Path": str(media)}}
             with patch("app.main.MEDIA_ROOT", directory), patch("app.main.JELLYFIN_API_KEY", "configured"), \
-                    patch("app.main.playback_sessions", new=AsyncMock(side_effect=[[active_session], [], []])), \
-                    patch("app.main.item_marked_played", new=AsyncMock(side_effect=[False, True])), \
+                    patch("app.main.playback_sessions", new=AsyncMock(side_effect=[[], [active_session], []])), \
                     patch("app.main.refresh_library", new=AsyncMock()) as refresh:
-                asyncio.run(check_temporary_media_playback())
+                asyncio.run(check_temporary_media_playback(now=1000 + TORRENT_RETENTION_SECONDS - 1))
                 self.assertTrue(media.exists())
-                asyncio.run(check_temporary_media_playback())
+                asyncio.run(check_temporary_media_playback(now=1000 + TORRENT_RETENTION_SECONDS))
                 self.assertTrue(media.exists())
-                asyncio.run(check_temporary_media_playback())
+                asyncio.run(check_temporary_media_playback(now=1000 + TORRENT_RETENTION_SECONDS + 30))
             self.assertFalse(media.exists())
             refresh.assert_awaited_once()
             with SessionLocal() as session:

@@ -26,9 +26,9 @@ Para as fileiras personalizadas da página inicial (baseadas no histórico assis
 - Jobs persistentes com progresso por SSE para adicionar temporada/serie, sincronizar metadata e importar arquivos. A sincronizacao detecta arquivos existentes e nunca os substitui.
 - Verificacao de arquivos locais e `.strm`, protecao SSRF para hosts de addons/streams, validacao CSRF, cookies de sessao seguros e limite de requisicoes.
 - Ao criar/importar arquivos, solicita atualizacao da biblioteca Jellyfin usando uma API key mantida apenas no backend.
-- Streams HTTPS diretos continuam gerando `.strm`. Streams Stremio com `infoHash` podem ser baixados sob ação do administrador; o torrent não é convertido em URL de site nem escrito como `.strm`.
-- O download torrent usa `aria2` no container, pasta de staging oculta e limite `MAX_TORRENT_BYTES` (20 GB por padrão). Quando o addon informa `fileIdx`, o índice é convertido para a numeração de arquivos do aria2; sem índice, o app seleciona o maior arquivo MP4/MKV/WEBM baixado. O aria2 encerra o seeding assim que termina o download e desiste depois de 30 minutos sem velocidade de download.
-- O arquivo final recebe nome/pasta Jellyfin, é registrado no SQLite como temporário e só pode ser removido se o caminho corresponder exatamente a um arquivo MP4/MKV/WEBM criado e rastreado pelo app. A cada 30 segundos, a aplicação observa `/Sessions`; depois que houve reprodução real e a sessão terminou, consulta `UserData.Played` no Jellyfin. Remove o arquivo quando o Jellyfin marca o item como reproduzido e solicita novo scan. Pausa, interrupção antes do status `Played`, falha da API ou ausência da chave Jellyfin mantêm o arquivo.
+- Streams HTTPS diretos continuam gerando `.strm`. Streams Stremio com `infoHash` e `fileIdx` podem ser baixados pelo administrador tanto para filmes quanto para episódios. O addon é consultado novamente antes de aceitar o job; o torrent não vira URL de site nem arquivo `.strm`.
+- O download torrent usa `aria2` no container, pasta de staging oculta e limite rígido de 20 GiB (o valor de `MAX_TORRENT_BYTES` pode reduzir o limite, nunca aumentá-lo). O `videoSize` informado pelo addon é conferido antes do job; se não vier, o tamanho real é monitorado durante a transferência e o download é interrompido ao passar do limite. Opções acima do limite ficam desabilitadas na interface. O aria2 encerra o seeding assim que termina e desiste depois de 30 minutos sem velocidade de download.
+- Filmes e episódios recebem a estrutura/nome Jellyfin e são registrados no SQLite como temporários. A aplicação remove o arquivo após oito horas do download concluído; se o Jellyfin ainda estiver reproduzindo o arquivo, aguarda a sessão terminar. Só remove um arquivo de vídeo dentro da biblioteca que também esteja associado ao registro temporário; em seguida solicita novo scan Jellyfin. O monitor depende da API key Jellyfin configurada.
 - O container não usa shell para executar dados do addon, não aceita trackers fornecidos pelo addon e limita a gravação ao staging. Use apenas torrents cujo conteúdo você tenha direito de baixar. Conteúdo ou resposta não é verificado automaticamente como domínio público.
 
 ### Brazuca Torrents
@@ -47,13 +47,13 @@ Manifest lido em 2026-10-07; resposta HTTP 200:
 }
 ```
 
-Decisão: esse manifest oferece somente streams P2P, não metadados nem busca de catálogo. O protocolo Stremio documenta `infoHash` e `fileIdx` como campos de torrent; a integração consulta o recurso `stream` anunciado e entrega esses valores ao aria2 sem tratá-los como URL direta. Em 2026-10-07, a requisição padrão `GET /stream/movie/tt0063350.json` respondeu HTTP 200 com este JSON:
+Decisão: esse manifest oferece somente streams P2P, não metadados nem busca de catálogo. O protocolo Stremio documenta `infoHash`, `fileIdx` e `videoSize` como propriedades de streams torrent; a integração consulta somente a rota `stream` anunciada e passa o hash/índice ao aria2 sem tratá-los como URL direta. Em 2026-10-07, a requisição padrão `GET /stream/movie/tt0063350.json` respondeu HTTP 200 com este JSON:
 
 ```json
 {"streams":[],"cacheMaxAge":60,"staleRevalidate":14400,"staleError":604800}
 ```
 
-A resposta veio marcada `HIT` e `STALE` pelo cache do addon, então nenhum objeto torrent real pôde ser validado nessa tentativa. Quando o endpoint retornar opções, a interface poderá listá-las; o job reconsulta o addon antes de iniciar o download.
+A resposta veio marcada `HIT` e `STALE` pelo cache do addon, então nenhum objeto torrent real pôde ser validado naquela tentativa. Na revisão de 2026-10-07, tanto o manifest quanto a rota de teste responderam HTTP 403 neste ambiente; não foi feito bypass. A integração aceita opções quando o endpoint retornar objetos `infoHash` válidos e reconsulta o addon ao iniciar cada job.
 
 ## Endpoints principais
 
@@ -66,6 +66,7 @@ A resposta veio marcada `HIT` e `STALE` pelo cache do addon, então nenhum objet
 - `POST /api/library/add/series/tt4158110/1/1` (administrador + CSRF)
 - `POST /api/library/add/series/tt4158110/season/1` (job para temporada)
 - `POST /api/jobs/download/movie/{imdb_id}` com `{ "provider_id": "...", "info_hash": "...", "file_idx": 0 }` (administrador + CSRF; job e download temporário)
+- `POST /api/jobs/download/series/{imdb_id}/{season}/{episode}` com `{ "provider_id": "...", "info_hash": "...", "file_idx": 0 }` (administrador + CSRF; episódio baixado temporariamente)
 - `POST /api/library/add/series/tt4158110` e `POST /api/library/sync/series/tt4158110` (jobs)
 - `POST /api/jobs/import/movie/{imdb_id}` / `POST /api/jobs/import/series/{imdb_id}/{season}/{episode}` e `PUT /api/jobs/{job_id}/upload` (administrador + CSRF)
 - `GET /api/jobs/{job_id}` e `GET /api/jobs/{job_id}/events` (sessao do dono ou administrador)

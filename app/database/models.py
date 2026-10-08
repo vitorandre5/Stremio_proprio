@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Integer, String, Text
+from sqlalchemy import Boolean, Float, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.db import Base
@@ -48,6 +48,7 @@ class TemporaryMedia(Base):
     jellyfin_item_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     jellyfin_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     playback_started: Mapped[bool] = mapped_column(Boolean, default=False)
+    downloaded_at: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(24), default="downloaded", index=True)
 
 
