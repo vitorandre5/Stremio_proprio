@@ -268,7 +268,9 @@ async def check_library_item(item_id: str) -> None:
 
 async def check_all_library_items() -> None:
     with SessionLocal() as session:
-        item_ids = [item.id for item in session.query(LibraryItem.id).filter(LibraryItem.stream_url != "local").all()]
+        item_ids = [item.id for item in session.query(LibraryItem.id).filter(
+            LibraryItem.stream_url != "local", ~LibraryItem.stream_url.startswith("torrent:")
+        ).all()]
     await asyncio.gather(*(check_library_item(item_id) for item_id in item_ids), return_exceptions=True)
 
 

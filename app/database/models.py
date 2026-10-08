@@ -38,6 +38,19 @@ class LibraryItem(Base):
     stream_url: Mapped[str] = mapped_column(Text)
 
 
+class TemporaryMedia(Base):
+    __tablename__ = "temporary_media"
+
+    info_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    imdb_id: Mapped[str] = mapped_column(String(24), index=True)
+    title: Mapped[str] = mapped_column(String(300))
+    path: Mapped[str] = mapped_column(Text, unique=True)
+    jellyfin_item_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    jellyfin_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    playback_started: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(24), default="downloaded", index=True)
+
+
 class LinkCheck(Base):
     __tablename__ = "link_checks"
 

@@ -9,6 +9,25 @@ from app import security
 
 
 class JellyfinAuthenticationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reads_active_sessions_and_played_state_with_server_key(self):
+        user_id = "a1a1a1a1-1111-4111-8111-111111111111"
+        item_id = "b2b2b2b2-2222-4222-8222-222222222222"
+        with patch.object(jellyfin_client, "JELLYFIN_URL", "https://jf.example.test"), patch.object(jellyfin_client, "JELLYFIN_API_KEY", "server-only-key"), patch.object(jellyfin_client.httpx, "AsyncClient") as client_type:
+            client = client_type.return_value.__aenter__.return_value
+            client.get = AsyncMock(side_effect=[
+                httpx.Response(200, json=[{"UserId": user_id, "NowPlayingItem": {"Id": item_id, "Path": "/media/movie.mkv"}}], request=httpx.Request("GET", "https://jf.example.test/Sessions")),
+                httpx.Response(200, json={"UserData": {"Played": True}}, request=httpx.Request("GET", f"https://jf.example.test/Users/{user_id}/Items/{item_id}")),
+            ])
+
+            sessions = await jellyfin_client.playback_sessions()
+            played = await jellyfin_client.item_marked_played(user_id, item_id)
+
+        self.assertEqual(sessions[0]["NowPlayingItem"]["Path"], "/media/movie.mkv")
+        self.assertTrue(played)
+        self.assertEqual(client.get.await_args_list[0].args[0], "https://jf.example.test/Sessions")
+        self.assertEqual(client.get.await_args_list[1].args[0], f"https://jf.example.test/Users/{user_id}/Items/{item_id}")
+        self.assertEqual(client.get.await_args_list[0].kwargs["headers"], {"X-Emby-Token": "server-only-key"})
+
     async def test_authenticates_and_discards_jellyfin_token(self):
         response = httpx.Response(200, json={"User": {"Id": "user-1", "Name": "Vitor"}, "AccessToken": "secret-token"})
         with patch.object(jellyfin_client, "JELLYFIN_URL", "https://jf.example.test"), patch.object(jellyfin_client.httpx, "AsyncClient") as client_type:

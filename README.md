@@ -12,9 +12,10 @@ Configure no Coolify `JELLYFIN_URL`, `JELLYFIN_API_KEY` e `SESSION_SECRET` (valo
 
 ## Funcionalidades
 
-- Busca filmes e series em Cinemeta por IMDb ID, com poster, ano, sinopse, temporadas, episodios e elenco quando disponiveis.
+- Busca filmes e series em Cinemeta e agrega resultados dos catálogos dos addons que declaram `catalog.extra.search`, mantendo IMDb IDs para abrir detalhes no catálogo Cinemeta quando disponíveis. Falhas de busca dos addons são mostradas por provider.
 - Login com as credenciais do Jellyfin. O token de autenticacao nao e persistido. Apenas administradores podem mudar addons, preferencias ou arquivos da biblioteca.
 - Cadastro de Manifest URLs Stremio: leitura e validacao do manifest, resources, types e idPrefixes opcionais, seguida de chamadas aos endpoints JSON anunciados. O sistema nao faz scraping HTML nem tenta contornar protecoes externas.
+- Busca de catálogo segue o manifest: só consulta `catalog/{type}/{catalogId}/search=...json` quando aquele catálogo anuncia a propriedade `search` em `extra`. Catálogos sem essa declaração não são consultados por busca textual.
 - Consulta dos addons ativos com prioridade de idioma dublado, depois legendado; preferencias de qualidade e provider controlam a ordem subsequente. FrostStream vem primeiro na consulta; os outros addons ativos funcionam como fallback.
 - Criacao de `.strm` com a URL HTTPS direta devolvida no campo `url` pelo addon. O arquivo nao recebe uma URL do dominio do Media Library Manager. As rotas `/stream/...` continuam disponiveis para resolucao dinamica, e o proxy so usa `behaviorHints.proxyHeaders` que o proprio addon forneceu.
 - Verificacao automatica a cada 5 minutos e logo apos a criacao. O backend consulta os addons de novo, testa ate cinco URLs com uma requisicao `Range: bytes=0-0` e registra estado, HTTP, horario e provider funcional. Quando encontra uma URL funcional, atualiza o `.strm` atomicamente com ela. Ao migrar um `.strm` legado do app, grava a primeira URL direta devolvida pelo addon mesmo se o teste falhar, mantendo o status como indisponivel; se nenhum addon devolver URL, conserva o conteudo existente. So atualiza arquivos gerenciados cujo conteudo ainda corresponde ao registro, preservando edicoes manuais. A tela mostra disponivel, stream invalido, sem fonte, arquivo ausente ou erro de verificacao.
@@ -22,6 +23,34 @@ Configure no Coolify `JELLYFIN_URL`, `JELLYFIN_API_KEY` e `SESSION_SECRET` (valo
 - Jobs persistentes com progresso por SSE para adicionar temporada/serie, sincronizar metadata e importar arquivos. A sincronizacao detecta arquivos existentes e nunca os substitui.
 - Verificacao de arquivos locais e `.strm`, protecao SSRF para hosts de addons/streams, validacao CSRF, cookies de sessao seguros e limite de requisicoes.
 - Ao criar/importar arquivos, solicita atualizacao da biblioteca Jellyfin usando uma API key mantida apenas no backend.
+- Streams HTTPS diretos continuam gerando `.strm`. Streams Stremio com `infoHash` podem ser baixados sob ação do administrador; o torrent não é convertido em URL de site nem escrito como `.strm`.
+- O download torrent usa `aria2` no container, pasta de staging oculta e limite `MAX_TORRENT_BYTES` (20 GB por padrão). Quando o addon informa `fileIdx`, o índice é convertido para a numeração de arquivos do aria2; sem índice, o app seleciona o maior arquivo MP4/MKV/WEBM baixado. O aria2 encerra o seeding assim que termina o download e desiste depois de 30 minutos sem velocidade de download.
+- O arquivo final recebe nome/pasta Jellyfin, é registrado no SQLite como temporário e só pode ser removido se o caminho corresponder exatamente a um arquivo MP4/MKV/WEBM criado e rastreado pelo app. A cada 30 segundos, a aplicação observa `/Sessions`; depois que houve reprodução real e a sessão terminou, consulta `UserData.Played` no Jellyfin. Remove o arquivo quando o Jellyfin marca o item como reproduzido e solicita novo scan. Pausa, interrupção antes do status `Played`, falha da API ou ausência da chave Jellyfin mantêm o arquivo.
+- O container não usa shell para executar dados do addon, não aceita trackers fornecidos pelo addon e limita a gravação ao staging. Use apenas torrents cujo conteúdo você tenha direito de baixar. Conteúdo ou resposta não é verificado automaticamente como domínio público.
+
+### Brazuca Torrents
+
+Manifest lido em 2026-10-07; resposta HTTP 200:
+
+```json
+{
+  "id": "com.stremio.brazuca.addon",
+  "version": "0.1.1",
+  "name": "Brazuca Torrents",
+  "catalogs": [],
+  "resources": [{"name": "stream", "types": ["movie", "series", "anime"], "idPrefixes": ["tt", "kitsu"]}],
+  "types": ["movie", "series", "anime", "other"],
+  "behaviorHints": {"configurable": true, "configurationRequired": false, "p2p": true}
+}
+```
+
+Decisão: esse manifest oferece somente streams P2P, não metadados nem busca de catálogo. O protocolo Stremio documenta `infoHash` e `fileIdx` como campos de torrent; a integração consulta o recurso `stream` anunciado e entrega esses valores ao aria2 sem tratá-los como URL direta. Em 2026-10-07, a requisição padrão `GET /stream/movie/tt0063350.json` respondeu HTTP 200 com este JSON:
+
+```json
+{"streams":[],"cacheMaxAge":60,"staleRevalidate":14400,"staleError":604800}
+```
+
+A resposta veio marcada `HIT` e `STALE` pelo cache do addon, então nenhum objeto torrent real pôde ser validado nessa tentativa. Quando o endpoint retornar opções, a interface poderá listá-las; o job reconsulta o addon antes de iniciar o download.
 
 ## Endpoints principais
 
@@ -32,6 +61,7 @@ Configure no Coolify `JELLYFIN_URL`, `JELLYFIN_API_KEY` e `SESSION_SECRET` (valo
 - `GET /api/streams/series/tt4158110/1/1` (requer sessao)
 - `POST /api/library/add/series/tt4158110/1/1` (administrador + CSRF)
 - `POST /api/library/add/series/tt4158110/season/1` (job para temporada)
+- `POST /api/jobs/download/movie/{imdb_id}` com `{ "provider_id": "...", "info_hash": "...", "file_idx": 0 }` (administrador + CSRF; job e download temporário)
 - `POST /api/library/add/series/tt4158110` e `POST /api/library/sync/series/tt4158110` (jobs)
 - `POST /api/jobs/import/movie/{imdb_id}` / `POST /api/jobs/import/series/{imdb_id}/{season}/{episode}` e `PUT /api/jobs/{job_id}/upload` (administrador + CSRF)
 - `GET /api/jobs/{job_id}` e `GET /api/jobs/{job_id}/events` (sessao do dono ou administrador)
@@ -39,7 +69,7 @@ Configure no Coolify `JELLYFIN_URL`, `JELLYFIN_API_KEY` e `SESSION_SECRET` (valo
 
 ## Validacao feita em 2026-10-07
 
-Frontend TypeScript, imagem Docker e Compose foram validados localmente; os testes cobrem autenticacao Jellyfin, cliente de addons, links dinamicos, verificacao curta de streams, progresso de jobs, sincronizacao sem sobrescrever arquivos e importacao organizada.
+Frontend TypeScript, imagem Docker e Compose foram validados localmente; os testes cobrem autenticacao Jellyfin, cliente de addons, links dinamicos, verificacao curta de streams, progresso de jobs, sincronizacao sem sobrescrever arquivos, importacao organizada, parsing de torrents e chamada segura do aria2.
 
 No site publicado, a busca por `Mr. Robot` retornou a serie de 2015 (`tt4158110`), quatro temporadas, 45 episodios, sinopse e elenco. A consulta ao S01E01 retornou uma fonte direta FenixFlix 1080p dublada. FrostStream e BestCine nao forneceram stream utilizavel no teste mais recente; o fallback FenixFlix funcionou. O PopPlay informado pelo usuario permanece indisponivel por falha de DNS, portanto nao foi adicionado como fonte funcional.
 

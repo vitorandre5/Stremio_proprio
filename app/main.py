@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import shutil
 import time
 import unicodedata
 from urllib.parse import urlsplit
@@ -17,15 +18,15 @@ from sqlalchemy import inspect, text
 from typing import Literal
 
 from app.database.db import Base, SessionLocal, engine
-from app.database.models import Addon, LibraryItem, LinkCheck, MetadataItem, Preference
-from app.jellyfin.client import authenticate_user, refresh_library
+from app.database.models import Addon, Job, LibraryItem, LinkCheck, MetadataItem, Preference, TemporaryMedia
+from app.jellyfin.client import authenticate_user, item_marked_played, playback_sessions, refresh_library
 from app.library.dynamic import dynamic_signature, dynamic_strm_url, verify_dynamic_signature
 from app.library.service import scan_movie, scan_series, series_folder_name, title_folder_name
-from app.config import BESTCINE_MANIFEST_URL, COOKIE_SECURE, FENIXFLIX_MANIFEST_URL, FROST_MANIFEST_URL, LINK_CHECK_INTERVAL_SECONDS, MAX_UPLOAD_BYTES, MEDIA_ROOT
+from app.config import BESTCINE_MANIFEST_URL, BRAZUCA_TORRENTS_MANIFEST_URL, COOKIE_SECURE, FENIXFLIX_MANIFEST_URL, FROST_MANIFEST_URL, JELLYFIN_API_KEY, LINK_CHECK_INTERVAL_SECONDS, MAX_TORRENT_BYTES, MAX_UPLOAD_BYTES, MEDIA_ROOT
 from app.metadata.cinemeta import details as get_metadata_details
 from app.metadata.cinemeta import search as search_metadata
 from app.stremio.client import read_manifest as read_addon_manifest
-from app.stremio.resolver import find_direct_streams, sort_streams
+from app.stremio.resolver import find_catalog_search_results, find_direct_streams, sort_streams, sort_torrents
 from app.security import (
     CSRF_COOKIE,
     SESSION_COOKIE,
@@ -42,10 +43,87 @@ from app.security import (
 from app.jobs.manager import can_access_job, create_job, get_job, mark_interrupted_jobs, start_task, update_job
 from app.jobs.link_checker import check_library_item, periodic_link_check
 from app.proxy.service import has_proxy_headers, proxy_stream
+from app.torrents.download import download_movie
 
 
 logger = logging.getLogger("media_library_manager")
 _SEARCH_AVAILABILITY_CACHE: dict[str, tuple[float, str, list[str]]] = {}
+
+
+async def check_temporary_media_playback() -> None:
+    sessions = await playback_sessions()
+    with SessionLocal() as session:
+        records = [
+            {"info_hash": item.info_hash, "path": item.path, "playback_started": item.playback_started,
+             "jellyfin_item_id": item.jellyfin_item_id, "jellyfin_user_id": item.jellyfin_user_id}
+            for item in session.query(TemporaryMedia).filter(TemporaryMedia.status == "downloaded").all()
+        ]
+    for record in records:
+        target = str(Path(record["path"]).resolve())
+        matching = [item for item in sessions if str(Path((item.get("NowPlayingItem") or {}).get("Path", "")).resolve()) == target]
+        if matching:
+            playback = matching[0]
+            item_id = (playback.get("NowPlayingItem") or {}).get("Id")
+            user_id = playback.get("UserId")
+            is_playing = not (playback.get("PlayState") or {}).get("IsPaused", False)
+            if is_playing and isinstance(item_id, str) and isinstance(user_id, str):
+                with SessionLocal() as session:
+                    current = session.get(TemporaryMedia, record["info_hash"])
+                    if current:
+                        current.playback_started = True
+                        current.jellyfin_item_id = item_id
+                        current.jellyfin_user_id = user_id
+                        session.commit()
+            continue
+        if not record["playback_started"] or not record["jellyfin_item_id"] or not record["jellyfin_user_id"]:
+            continue
+        if not await item_marked_played(record["jellyfin_user_id"], record["jellyfin_item_id"]):
+            continue
+        root = Path(MEDIA_ROOT).resolve()
+        media_path = Path(record["path"]).resolve()
+        if root not in media_path.parents or media_path.suffix.lower() not in {".mp4", ".mkv", ".webm"}:
+            logger.error("Refusing to remove temporary media outside allowed library path: %s", record["info_hash"])
+            continue
+        try:
+            media_path.unlink(missing_ok=True)
+            with SessionLocal() as session:
+                current = session.get(TemporaryMedia, record["info_hash"])
+                if current and str(Path(current.path).resolve()) == str(media_path):
+                    item = session.query(LibraryItem).filter(LibraryItem.path == str(media_path)).one_or_none()
+                    if item:
+                        session.delete(item)
+                    session.delete(current)
+                    session.commit()
+            try:
+                await refresh_library()
+            except HTTPException as exc:
+                logger.warning("Temporary media removed; Jellyfin refresh failed: %s", exc.detail)
+        except OSError:
+            logger.exception("Could not remove watched temporary media: %s", record["info_hash"])
+
+
+async def periodic_temporary_media_cleanup() -> None:
+    while True:
+        if JELLYFIN_API_KEY:
+            try:
+                await check_temporary_media_playback()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Temporary media playback monitor failed")
+        await asyncio.sleep(30)
+
+
+def clear_interrupted_torrent_staging() -> None:
+    staging_root = (Path(MEDIA_ROOT).resolve() / ".mlm-torrents").resolve()
+    if not staging_root.is_dir():
+        return
+    with SessionLocal() as session:
+        job_ids = [job_id for (job_id,) in session.query(Job.id).filter(Job.kind == "torrent_download", Job.status == "failed").all()]
+    for job_id in job_ids:
+        candidate = (staging_root / job_id).resolve()
+        if staging_root in candidate.parents and candidate.is_dir():
+            shutil.rmtree(candidate, ignore_errors=True)
 
 
 @asynccontextmanager
@@ -56,11 +134,13 @@ async def lifespan(_: FastAPI):
         with engine.begin() as connection:
             connection.execute(text("ALTER TABLE link_checks ADD COLUMN provider_id VARCHAR(160)"))
     mark_interrupted_jobs()
+    clear_interrupted_torrent_staging()
     with SessionLocal() as session:
         for addon_id, name, manifest_url in (
             ("com.froststream", "FrostStream", FROST_MANIFEST_URL),
             ("com.bestcine.multisource", "BestCine", BESTCINE_MANIFEST_URL),
             ("com.fenixflix", "FenixFlix", FENIXFLIX_MANIFEST_URL),
+            ("com.stremio.brazuca.addon", "Brazuca Torrents", BRAZUCA_TORRENTS_MANIFEST_URL),
         ):
             if session.get(Addon, addon_id) is None:
                 session.add(Addon(id=addon_id, name=name, manifest_url=manifest_url, enabled=True))
@@ -68,12 +148,18 @@ async def lifespan(_: FastAPI):
             session.add(Preference(id=1))
         session.commit()
     link_check_task = asyncio.create_task(periodic_link_check(LINK_CHECK_INTERVAL_SECONDS))
+    temporary_media_task = asyncio.create_task(periodic_temporary_media_cleanup())
     try:
         yield
     finally:
         link_check_task.cancel()
+        temporary_media_task.cancel()
         try:
             await link_check_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await temporary_media_task
         except asyncio.CancelledError:
             pass
 
@@ -123,6 +209,12 @@ class LoginPayload(BaseModel):
 
 class StreamChoice(BaseModel):
     url: str = Field(min_length=1, max_length=4096)
+
+
+class TorrentChoice(BaseModel):
+    info_hash: str = Field(pattern=r"^[0-9a-fA-F]{40}$")
+    provider_id: str = Field(min_length=1, max_length=160)
+    file_idx: int | None = Field(default=None, ge=0)
 
 
 class AddonPayload(BaseModel):
@@ -188,7 +280,22 @@ async def search(
     if not normalized_query:
         return {"results": []}
 
-    results = await _rank_search_results(normalized_query, await search_metadata(normalized_query, media_type))
+    metadata_results = await search_metadata(normalized_query, media_type)
+    with SessionLocal() as session:
+        addons = session.query(Addon).filter(Addon.enabled.is_(True)).order_by(Addon.id).all()
+        addon_config = [{"id": addon.id, "name": addon.name, "manifest_url": addon.manifest_url} for addon in addons]
+    catalog_metas = []
+    catalog_errors = []
+    media_types = ["movie", "series"] if media_type == "all" else [media_type]
+    for requested_type in media_types:
+        catalog_response = await find_catalog_search_results(addon_config, requested_type, normalized_query)
+        catalog_metas.extend(catalog_response["metas"])
+        catalog_errors.extend(catalog_response["addon_errors"])
+    results = await _rank_search_results(
+        normalized_query,
+        _merge_search_results(metadata_results, catalog_metas),
+    )
+    unique_errors = {(item["provider"], item["detail"]): item for item in catalog_errors}
     with SessionLocal() as session:
         for item in results:
             record = session.get(MetadataItem, item["id"])
@@ -198,7 +305,45 @@ async def search(
             for field in ("media_type", "tmdb_id", "imdb_id", "title", "year", "poster_url", "overview"):
                 setattr(record, field, item.get(field))
         session.commit()
-    return {"results": results}
+    return {"results": results, "addon_search_errors": list(unique_errors.values())}
+
+
+def _merge_search_results(metadata_results: list[dict], catalog_metas: list[dict]) -> list[dict]:
+    merged = [dict(item) for item in metadata_results]
+    by_imdb_id = {
+        (item.get("media_type"), item.get("imdb_id")): index
+        for index, item in enumerate(merged)
+        if isinstance(item.get("imdb_id"), str)
+    }
+    for meta in catalog_metas:
+        media_type = meta.get("type") or meta.get("media_type")
+        imdb_id = meta.get("imdb_id") or meta.get("id")
+        if media_type not in {"movie", "series"} or not isinstance(imdb_id, str) or not re.fullmatch(r"tt\d+", imdb_id):
+            continue
+        key = (media_type, imdb_id)
+        index = by_imdb_id.get(key)
+        if index is None:
+            year_text = meta.get("releaseInfo") or meta.get("year")
+            year = int(year_text[:4]) if isinstance(year_text, str) and len(year_text) >= 4 and year_text[:4].isdigit() else None
+            tmdb_value = meta.get("moviedb_id")
+            tmdb_id = int(tmdb_value) if isinstance(tmdb_value, int) or (isinstance(tmdb_value, str) and tmdb_value.isdigit()) else None
+            merged.append({
+                "id": imdb_id,
+                "media_type": media_type,
+                "imdb_id": imdb_id,
+                "tmdb_id": tmdb_id,
+                "title": meta.get("name") or "Título sem nome",
+                "year": year,
+                "poster_url": meta.get("poster"),
+                "overview": meta.get("description") or meta.get("overview") or "",
+                "catalog_providers": [meta["catalog_provider"]],
+            })
+            by_imdb_id[key] = len(merged) - 1
+        else:
+            providers = merged[index].setdefault("catalog_providers", [])
+            if meta["catalog_provider"] not in providers:
+                providers.append(meta["catalog_provider"])
+    return merged
 
 
 def _search_title_rank(query: str, title: str) -> int:
@@ -237,12 +382,21 @@ async def _rank_search_results(query: str, results: list[dict]) -> list[dict]:
         async with semaphore:
             try:
                 async with asyncio.timeout(8):
-                    streams = await _streams_for(media_type, imdb_id)
+                    video_id = imdb_id
+                    if media_type == "series":
+                        details = await get_metadata_details("series", imdb_id)
+                        first_episode = next(iter(details.get("episodes") or []), None)
+                        if not first_episode:
+                            return "unknown", []
+                        video_id = first_episode.get("id") or f"{imdb_id}:{first_episode['season_number']}:{first_episode['episode_number']}"
+                    streams = await _streams_for(media_type, video_id)
             except Exception:
                 _SEARCH_AVAILABILITY_CACHE[cache_key] = (time.monotonic() + 30, "unknown", [])
                 return "unknown", []
-        providers = list(dict.fromkeys(stream["provider"] for stream in streams["streams"]))
-        status = "available" if providers else "unknown" if streams["addon_errors"] else "unavailable"
+        providers = list(dict.fromkeys(stream["provider"] for stream in [*streams["streams"], *streams.get("torrents", [])]))
+        # A series has no single stream ID: Stremio requests per-video IDs. A
+        # negative result for its first episode cannot prove the whole series is unavailable.
+        status = "available" if providers else "unknown" if streams["addon_errors"] or media_type == "series" else "unavailable"
         _SEARCH_AVAILABILITY_CACHE[cache_key] = (time.monotonic() + (300 if status != "unknown" else 30), status, providers)
         return status, providers
 
@@ -251,7 +405,8 @@ async def _rank_search_results(query: str, results: list[dict]) -> list[dict]:
     ranked = []
     for original_rank, (item, (status, providers)) in enumerate(zip(results, checks)):
         ranked_item = {**item, "availability": status, "available_providers": providers}
-        ranked.append((availability_rank[status], _search_title_rank(query, item["title"]), original_rank, ranked_item))
+        source_rank = 0 if status == "available" else 1 if item.get("catalog_providers") else availability_rank[status] + 1
+        ranked.append((source_rank, _search_title_rank(query, item["title"]), original_rank, ranked_item))
     ranked.sort(key=lambda entry: entry[:3])
     return [entry[3] for entry in ranked]
 
@@ -394,6 +549,7 @@ async def _streams_for(media_type: str, video_id: str, preferred_provider_overri
     ))
     result = await find_direct_streams(config, media_type, video_id)
     sort_streams(result["streams"], config, preferred_quality)
+    sort_torrents(result.get("torrents", []), config, preferred_quality)
     return result
 
 @app.get("/api/streams/movie/{imdb_id}")
@@ -567,6 +723,96 @@ async def add_episode(
             result["jellyfin_scan_error"] = exc.detail
             result["message"] = f"Arquivo .strm criado, mas o scan Jellyfin falhou: {exc.detail}"
     return result
+
+
+async def _run_torrent_download(job_id: str, imdb_id: str, details: dict, selected: dict) -> None:
+    media_root = Path(MEDIA_ROOT).resolve()
+    staging_root = media_root / ".mlm-torrents"
+    staging_path = staging_root / job_id
+    staged_file = None
+    published_file = None
+    try:
+        update_job(job_id, status="running", total=1, completed=0, failed=0, message="Baixando torrent autorizado em pasta temporaria.")
+        last_report = 0.0
+        last_bytes = -1
+
+        def report(byte_count: int) -> None:
+            nonlocal last_report, last_bytes
+            now = time.monotonic()
+            if byte_count != last_bytes and (now - last_report >= 10 or byte_count == 0):
+                update_job(job_id, message=f"Baixando torrent: {byte_count // (1024 * 1024)} MB recebidos.")
+                last_report, last_bytes = now, byte_count
+
+        staged_file = await download_movie(selected["info_hash"], staging_path, MAX_TORRENT_BYTES, report, selected.get("file_idx"))
+        folder_name = title_folder_name(details["title"], details.get("year"))
+        relative = Path(folder_name) / f"{folder_name}{staged_file.suffix.lower()}"
+        published_file = _media_path(relative)
+        published_file.parent.mkdir(parents=True, exist_ok=True)
+        os.link(staged_file, published_file)
+        item_id = f"movie:{imdb_id}"
+        with SessionLocal() as session:
+            tracked = session.get(TemporaryMedia, selected["info_hash"])
+            if tracked is not None:
+                raise RuntimeError("Este torrent ja esta cadastrado como midia temporaria.")
+            library_item = session.get(LibraryItem, item_id)
+            if library_item is None:
+                library_item = LibraryItem(id=item_id, media_type="movie", imdb_id=imdb_id, title=details["title"], path=str(published_file), stream_url=f"torrent:{selected['info_hash']}")
+                session.add(library_item)
+            else:
+                library_item.path = str(published_file)
+                library_item.stream_url = f"torrent:{selected['info_hash']}"
+            session.add(TemporaryMedia(info_hash=selected["info_hash"], imdb_id=imdb_id, title=details["title"], path=str(published_file)))
+            session.commit()
+        try:
+            await refresh_library()
+            scan_message = "Download concluido. Jellyfin atualizado; o arquivo sera removido quando o Jellyfin marcar o filme como reproduzido."
+            scan_state = "requested"
+        except HTTPException as exc:
+            scan_message = f"Download concluido, mas a atualizacao Jellyfin falhou: {exc.detail}"
+            scan_state = "failed"
+        update_job(job_id, status="completed", total=1, completed=1, message=scan_message, result={"path": str(published_file), "temporary": True, "delete_when_played": True, "jellyfin_scan": scan_state})
+    except Exception as exc:
+        logger.exception("Torrent download job %s failed", job_id)
+        if published_file is not None:
+            with SessionLocal() as session:
+                tracked = session.query(TemporaryMedia).filter(TemporaryMedia.path == str(published_file)).one_or_none()
+                if tracked is None:
+                    published_file.unlink(missing_ok=True)
+        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)[:400] or "Falha ao baixar torrent."
+        update_job(job_id, status="failed", failed=1, message=detail, result={"error": detail})
+    finally:
+        if staging_path.exists() and staging_root.resolve() in staging_path.resolve().parents:
+            shutil.rmtree(staging_path, ignore_errors=True)
+
+
+@app.post("/api/jobs/download/movie/{imdb_id}", status_code=202)
+async def download_movie_job(
+    imdb_id: str,
+    choice: TorrentChoice,
+    request: Request,
+    _: None = Depends(require_admin_mutation),
+) -> dict:
+    if not re.fullmatch(r"tt\d+", imdb_id):
+        raise HTTPException(status_code=422, detail="IMDb ID invalido.")
+    details = await get_metadata_details("movie", imdb_id)
+    existing = scan_movie(MEDIA_ROOT, details["title"], details.get("year"))
+    if existing["status"] != "missing":
+        raise HTTPException(status_code=409, detail="Ja existe um arquivo para este filme; nada foi sobrescrito.")
+    streams = await _streams_for("movie", imdb_id)
+    torrent = next((item for item in streams.get("torrents", []) if item["info_hash"] == choice.info_hash.lower() and item["provider_id"] == choice.provider_id and item.get("file_idx") == choice.file_idx), None)
+    if torrent is None:
+        errors = "; ".join(f"{item['provider']}: {item['detail']}" for item in streams.get("addon_errors", []))
+        detail = "O torrent selecionado nao aparece mais na resposta atual do addon."
+        if errors:
+            detail += " " + errors
+        raise HTTPException(status_code=409, detail=detail)
+    with SessionLocal() as session:
+        if session.get(TemporaryMedia, torrent["info_hash"]):
+            raise HTTPException(status_code=409, detail="Este torrent ja esta sendo mantido como arquivo temporario.")
+    user = session_user(request.cookies.get(SESSION_COOKIE)) or {}
+    job = create_job("torrent_download", user.get("user_id", ""), total=1, message="Preparando download torrent.")
+    start_task(_run_torrent_download(job["id"], imdb_id, details, torrent))
+    return {"job_id": job["id"], "status": "queued"}
 
 
 def _save_metadata(details: dict) -> None:

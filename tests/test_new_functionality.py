@@ -11,13 +11,45 @@ os.environ["SESSION_SECRET"] = "test-session-secret-value-at-least-32-characters
 
 from app.jobs.manager import create_job, get_job, update_job
 from app.library import dynamic
-from app.main import _episode_strm_path, _rank_search_results, _run_episode_job, app
+from app.database.db import Base, SessionLocal, engine
+from app.database.models import LibraryItem, TemporaryMedia
+from app.main import _episode_strm_path, _merge_search_results, _rank_search_results, _run_episode_job, app, check_temporary_media_playback
 from app.stremio.manifest import supports
 from app.security import check_request_rate_limit
 from fastapi.testclient import TestClient
 
 
 class NewFunctionalityTests(unittest.TestCase):
+    def test_torrent_file_is_removed_only_after_jellyfin_marks_played_and_session_ends(self):
+        Base.metadata.create_all(bind=engine)
+        info_hash = "c" * 40
+        user_id = "a1a1a1a1-1111-4111-8111-111111111111"
+        jellyfin_item_id = "b2b2b2b2-2222-4222-8222-222222222222"
+        with tempfile.TemporaryDirectory() as directory:
+            media = Path(directory) / "Public Film (1930)" / "Public Film (1930).mkv"
+            media.parent.mkdir(parents=True)
+            media.write_bytes(b"movie")
+            with SessionLocal() as session:
+                session.query(TemporaryMedia).filter_by(info_hash=info_hash).delete()
+                session.query(LibraryItem).filter_by(id="movie:tt0123000").delete()
+                session.add(TemporaryMedia(info_hash=info_hash, imdb_id="tt0123000", title="Public Film", path=str(media), status="downloaded"))
+                session.add(LibraryItem(id="movie:tt0123000", media_type="movie", imdb_id="tt0123000", title="Public Film", path=str(media), stream_url=f"torrent:{info_hash}"))
+                session.commit()
+            active_session = {"UserId": user_id, "PlayState": {"IsPaused": False}, "NowPlayingItem": {"Id": jellyfin_item_id, "Path": str(media)}}
+            with patch("app.main.MEDIA_ROOT", directory), patch("app.main.JELLYFIN_API_KEY", "configured"), \
+                    patch("app.main.playback_sessions", new=AsyncMock(side_effect=[[active_session], [], []])), \
+                    patch("app.main.item_marked_played", new=AsyncMock(side_effect=[False, True])), \
+                    patch("app.main.refresh_library", new=AsyncMock()) as refresh:
+                asyncio.run(check_temporary_media_playback())
+                self.assertTrue(media.exists())
+                asyncio.run(check_temporary_media_playback())
+                self.assertTrue(media.exists())
+                asyncio.run(check_temporary_media_playback())
+            self.assertFalse(media.exists())
+            refresh.assert_awaited_once()
+            with SessionLocal() as session:
+                self.assertIsNone(session.get(TemporaryMedia, info_hash))
+
     def test_search_ranks_titles_with_addon_streams_first(self):
         results = [
             {"id": "tt1234567", "imdb_id": "tt1234567", "media_type": "movie", "title": "Mr. Robot", "year": 2025},
@@ -26,19 +58,35 @@ class NewFunctionalityTests(unittest.TestCase):
         ]
 
         async def streams_for(_media_type, imdb_id):
-            if imdb_id == "tt4158110":
+            if imdb_id == "tt4158110:1:1":
                 return {"streams": [{"provider": "FrostStream"}], "addon_errors": []}
             return {"streams": [], "addon_errors": []}
 
         with patch.dict("app.main._SEARCH_AVAILABILITY_CACHE", {}, clear=True), patch(
             "app.main._streams_for", new=AsyncMock(side_effect=streams_for)
-        ):
+        ), patch("app.main.get_metadata_details", new=AsyncMock(return_value={"episodes": [
+            {"id": "tt4158110:1:1", "season_number": 1, "episode_number": 1},
+        ]})):
             ranked = asyncio.run(_rank_search_results("Mr. Robot", results))
 
         self.assertEqual(ranked[0]["imdb_id"], "tt4158110")
         self.assertEqual(ranked[0]["availability"], "available")
         self.assertEqual(ranked[0]["available_providers"], ["FrostStream"])
         self.assertEqual([item["availability"] for item in ranked[1:]], ["unavailable", "unavailable"])
+
+    def test_addon_catalog_search_results_merge_by_imdb_id(self):
+        cinemeta = [{"id": "tt0343818", "imdb_id": "tt0343818", "media_type": "movie", "title": "I, Robot", "year": 2004}]
+        addon_results = [
+            {"id": "tt0343818", "type": "movie", "name": "Eu, Robô", "catalog_provider": "Example"},
+            {"id": "tt7654321", "type": "movie", "name": "Outro Filme", "catalog_provider": "Example"},
+        ]
+
+        merged = _merge_search_results(cinemeta, addon_results)
+
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(merged[0]["catalog_providers"], ["Example"])
+        self.assertEqual(merged[1]["imdb_id"], "tt7654321")
+        self.assertEqual(merged[1]["poster_url"], None)
 
     def test_manifest_without_id_prefixes_supports_all_ids(self):
         manifest = {"types": ["series"], "resources": [{"name": "stream", "types": ["series"]}]}

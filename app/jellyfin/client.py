@@ -1,4 +1,5 @@
 from urllib.parse import urlsplit
+import re
 
 import httpx
 from fastapi import HTTPException
@@ -62,3 +63,32 @@ async def refresh_library() -> None:
 
     if response.status_code not in {200, 204}:
         raise HTTPException(status_code=503, detail=f"O Jellyfin recusou a atualizacao (HTTP {response.status_code}).")
+
+
+async def playback_sessions() -> list[dict]:
+    if not JELLYFIN_API_KEY:
+        raise HTTPException(status_code=503, detail="Configure JELLYFIN_API_KEY no Coolify.")
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+            response = await client.get(f"{_base_url()}/Sessions", headers={"X-Emby-Token": JELLYFIN_API_KEY})
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="Nao foi possivel consultar sessoes do Jellyfin.") from exc
+    return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
+
+async def item_marked_played(user_id: str, item_id: str) -> bool:
+    if not JELLYFIN_API_KEY or not re.fullmatch(r"[0-9a-fA-F-]{36}", user_id) or not re.fullmatch(r"[0-9a-fA-F-]{36}", item_id):
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+            response = await client.get(
+                f"{_base_url()}/Users/{user_id}/Items/{item_id}",
+                headers={"X-Emby-Token": JELLYFIN_API_KEY},
+            )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return False
+    return bool(payload.get("UserData", {}).get("Played")) if isinstance(payload, dict) else False

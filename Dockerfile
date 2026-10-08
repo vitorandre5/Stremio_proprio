@@ -13,6 +13,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends aria2 \
+    && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home appuser \
     && mkdir -p /data \
     && chown appuser:appuser /data
