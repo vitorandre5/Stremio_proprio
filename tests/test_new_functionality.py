@@ -121,6 +121,21 @@ class NewFunctionalityTests(unittest.TestCase):
         self.assertEqual(ranked[0]["available_providers"], ["FrostStream"])
         self.assertEqual([item["availability"] for item in ranked[1:]], ["unavailable", "unavailable"])
 
+    def test_search_limits_live_stream_checks_to_the_most_relevant_results(self):
+        results = [
+            {"id": f"tt123456{i}", "imdb_id": f"tt123456{i}", "media_type": "movie", "title": "Match" if i == 0 else f"Match {i}"}
+            for i in range(10)
+        ]
+        streams_for = AsyncMock(return_value={"streams": [], "addon_errors": []})
+        with patch.dict("app.main._SEARCH_AVAILABILITY_CACHE", {}, clear=True), patch(
+            "app.main._streams_for", new=streams_for
+        ):
+            ranked = asyncio.run(_rank_search_results("Match", results))
+
+        self.assertEqual(streams_for.await_count, 8)
+        self.assertEqual(ranked[0]["imdb_id"], "tt1234560")
+        self.assertEqual(sum(item["availability"] == "unknown" for item in ranked), 2)
+
     def test_addon_catalog_search_results_merge_by_imdb_id(self):
         cinemeta = [{"id": "tt0343818", "imdb_id": "tt0343818", "media_type": "movie", "title": "I, Robot", "year": 2004}]
         addon_results = [

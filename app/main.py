@@ -18,11 +18,12 @@ from sqlalchemy import inspect, text
 from typing import Literal
 
 from app.database.db import Base, SessionLocal, engine
+from app.database.migration import migrate_sqlite_to_postgresql
 from app.database.models import Addon, Job, LibraryItem, LinkCheck, MetadataItem, Preference, TemporaryMedia
 from app.jellyfin.client import authenticate_user, item_image as get_jellyfin_item_image, playback_sessions, refresh_library, resume_items as get_resume_items, user_item as get_jellyfin_user_item, watched_media as get_watched_media
 from app.library.dynamic import dynamic_signature, dynamic_strm_url, verify_dynamic_signature
 from app.library.service import scan_movie, scan_series, series_folder_name, title_folder_name
-from app.config import BESTCINE_MANIFEST_URL, BRAZUCA_TORRENTS_MANIFEST_URL, COOKIE_SECURE, FENIXFLIX_MANIFEST_URL, FROST_MANIFEST_URL, JELLYFIN_API_KEY, JELLYFIN_URL, LINK_CHECK_INTERVAL_SECONDS, MAX_TORRENT_BYTES, MAX_UPLOAD_BYTES, MEDIA_ROOT, TMDB_API_TOKEN
+from app.config import BESTCINE_MANIFEST_URL, BRAZUCA_TORRENTS_MANIFEST_URL, COOKIE_SECURE, FENIXFLIX_MANIFEST_URL, FROST_MANIFEST_URL, JELLYFIN_API_KEY, JELLYFIN_URL, LINK_CHECK_INTERVAL_SECONDS, MAX_TORRENT_BYTES, MAX_UPLOAD_BYTES, MEDIA_ROOT, SQLITE_MIGRATION_URL, TMDB_API_TOKEN
 from app.metadata.cinemeta import details as get_metadata_details
 from app.metadata.service import details as get_localized_metadata_details
 from app.metadata.service import localize_results as localize_metadata_results
@@ -46,12 +47,16 @@ from app.security import (
 from app.jobs.manager import can_access_job, create_job, get_job, mark_interrupted_jobs, start_task, update_job
 from app.jobs.link_checker import check_library_item, periodic_link_check
 from app.proxy.service import has_proxy_headers, proxy_stream
+from app.search_cache import close_search_cache, get_search_response, set_search_response
 from app.torrents.download import download_movie
 
 
 logger = logging.getLogger("media_library_manager")
 _SEARCH_AVAILABILITY_CACHE: dict[str, tuple[float, str, list[str]]] = {}
 TORRENT_RETENTION_SECONDS = 8 * 60 * 60
+SEARCH_CATALOG_TIMEOUT_SECONDS = 4
+SEARCH_STREAM_CHECK_TIMEOUT_SECONDS = 3
+SEARCH_STREAM_CHECK_LIMIT = 8
 
 
 async def check_temporary_media_playback(now: float | None = None) -> None:
@@ -134,6 +139,7 @@ def clear_interrupted_torrent_staging() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
+    migrate_sqlite_to_postgresql(SQLITE_MIGRATION_URL, engine)
     check_columns = {column["name"] for column in inspect(engine).get_columns("link_checks")}
     if "provider_id" not in check_columns:
         with engine.begin() as connection:
@@ -172,6 +178,7 @@ async def lifespan(_: FastAPI):
             await temporary_media_task
         except asyncio.CancelledError:
             pass
+        await close_search_cache()
 
 
 app = FastAPI(title="Media Library Manager", version="0.1.0", lifespan=lifespan)
@@ -380,17 +387,34 @@ async def search(
     if not normalized_query:
         return {"results": []}
 
-    metadata_results = await search_metadata(normalized_query, media_type)
+    cached = await get_search_response(normalized_query, media_type)
+    if cached is not None:
+        return cached
+
     with SessionLocal() as session:
         addons = session.query(Addon).filter(Addon.enabled.is_(True)).order_by(Addon.id).all()
         addon_config = [{"id": addon.id, "name": addon.name, "manifest_url": addon.manifest_url} for addon in addons]
+    media_types = ["movie", "series"] if media_type == "all" else [media_type]
+
+    async def catalog_search(requested_type: str) -> dict:
+        try:
+            async with asyncio.timeout(SEARCH_CATALOG_TIMEOUT_SECONDS):
+                return await find_catalog_search_results(addon_config, requested_type, normalized_query)
+        except TimeoutError:
+            return {"metas": [], "addon_errors": [{"provider": "Addons", "detail": "A pesquisa nos catálogos excedeu o tempo limite."}]}
+
+    upstream_results = await asyncio.gather(
+        search_metadata(normalized_query, media_type),
+        *(catalog_search(requested_type) for requested_type in media_types),
+        return_exceptions=True,
+    )
+    metadata_results = upstream_results[0] if isinstance(upstream_results[0], list) else []
     catalog_metas = []
     catalog_errors = []
-    media_types = ["movie", "series"] if media_type == "all" else [media_type]
-    for requested_type in media_types:
-        catalog_response = await find_catalog_search_results(addon_config, requested_type, normalized_query)
-        catalog_metas.extend(catalog_response["metas"])
-        catalog_errors.extend(catalog_response["addon_errors"])
+    for response in upstream_results[1:]:
+        if isinstance(response, dict):
+            catalog_metas.extend(response["metas"])
+            catalog_errors.extend(response["addon_errors"])
     merged_results = await localize_metadata_results(_merge_search_results(metadata_results, catalog_metas))
     results = await _rank_search_results(normalized_query, merged_results)
     unique_errors = {(item["provider"], item["detail"]): item for item in catalog_errors}
@@ -403,7 +427,9 @@ async def search(
             for field in ("media_type", "tmdb_id", "imdb_id", "title", "year", "poster_url", "overview"):
                 setattr(record, field, item.get(field))
         session.commit()
-    return {"results": results, "addon_search_errors": list(unique_errors.values())}
+    response = {"results": results, "addon_search_errors": list(unique_errors.values())}
+    await set_search_response(normalized_query, media_type, response)
+    return response
 
 
 def _merge_search_results(metadata_results: list[dict], catalog_metas: list[dict]) -> list[dict]:
@@ -473,11 +499,20 @@ def _search_item_title_rank(query: str, item: dict) -> int:
 async def _rank_search_results(query: str, results: list[dict]) -> list[dict]:
     semaphore = asyncio.Semaphore(8)
     now = time.monotonic()
+    candidate_indexes = sorted(
+        range(len(results)),
+        key=lambda index: (
+            0 if results[index].get("catalog_providers") else 1,
+            _search_item_title_rank(query, results[index]),
+            index,
+        ),
+    )[:SEARCH_STREAM_CHECK_LIMIT]
+    candidates = set(candidate_indexes)
 
-    async def availability(item: dict) -> tuple[str, list[str]]:
+    async def availability(item: dict, should_check: bool) -> tuple[str, list[str]]:
         media_type = item.get("media_type")
         imdb_id = item.get("imdb_id") or item.get("id")
-        if media_type not in {"movie", "series"} or not isinstance(imdb_id, str) or not re.fullmatch(r"tt\d+", imdb_id):
+        if not should_check or media_type not in {"movie", "series"} or not isinstance(imdb_id, str) or not re.fullmatch(r"tt\d+", imdb_id):
             return "unknown", []
         cache_key = f"{media_type}:{imdb_id}"
         cached = _SEARCH_AVAILABILITY_CACHE.get(cache_key)
@@ -485,7 +520,7 @@ async def _rank_search_results(query: str, results: list[dict]) -> list[dict]:
             return cached[1], cached[2]
         async with semaphore:
             try:
-                async with asyncio.timeout(8):
+                async with asyncio.timeout(SEARCH_STREAM_CHECK_TIMEOUT_SECONDS):
                     video_id = imdb_id
                     if media_type == "series":
                         details = await get_metadata_details("series", imdb_id)
@@ -504,12 +539,16 @@ async def _rank_search_results(query: str, results: list[dict]) -> list[dict]:
         _SEARCH_AVAILABILITY_CACHE[cache_key] = (time.monotonic() + (300 if status != "unknown" else 30), status, providers)
         return status, providers
 
-    checks = await asyncio.gather(*(availability(item) for item in results))
-    availability_rank = {"available": 0, "unknown": 1, "unavailable": 2}
+    checks = await asyncio.gather(*(availability(item, index in candidates) for index, item in enumerate(results)))
     ranked = []
     for original_rank, (item, (status, providers)) in enumerate(zip(results, checks)):
         ranked_item = {**item, "availability": status, "available_providers": providers}
-        source_rank = 0 if status == "available" else 1 if item.get("catalog_providers") else availability_rank[status] + 1
+        source_rank = (
+            0 if status == "available"
+            else 1 if item.get("catalog_providers")
+            else 2 if original_rank in candidates
+            else 3
+        )
         ranked.append((source_rank, _search_item_title_rank(query, item), original_rank, ranked_item))
     ranked.sort(key=lambda entry: entry[:3])
     return [entry[3] for entry in ranked]

@@ -3,8 +3,12 @@ import os
 
 TMDB_API_TOKEN = os.getenv("TMDB_API_TOKEN", "").strip()
 TMDB_LANGUAGE = os.getenv("TMDB_LANGUAGE", "pt-BR").strip() or "pt-BR"
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
 DATABASE_URL = os.getenv(
     "DATABASE_URL", "sqlite:////data/media_library.sqlite3"
+).strip()
+SQLITE_MIGRATION_URL = os.getenv(
+    "SQLITE_MIGRATION_URL", "sqlite:////data/media_library.sqlite3"
 ).strip()
 FROST_MANIFEST_URL = os.getenv(
     "FROST_MANIFEST_URL", "https://froststream.cloutteam.com/manifest.json"

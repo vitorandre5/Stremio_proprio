@@ -600,7 +600,7 @@ export default function App() {
         </a>
         <nav className="sidebar-nav" aria-label="Navegacao principal">
           <button aria-label="Descobrir" title="Descobrir" className={`sidebar-link ${view === "library" ? "active" : ""}`} type="button" onClick={() => setView("library")}><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m16 16 4 4M8.5 13.5l2-5 5-2-2 5-5 2Z"/></svg><span className="nav-label">Descobrir</span></button>
-          {isAdmin && <button aria-label={"Configurções"} title={"Configurações"} className={`sidebar-link ${view === "settings" ? "active" : ""}`} type="button" onClick={() => view === "settings" ? setView("library") : void openSettings()}><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="m19.4 15 .1.1 1.2.9-1.2 2.1-1.4-.6a7.8 7.8 0 0 1-1.5.9l-.2 1.5h-2.4l-.2-1.5a7.8 7.8 0 0 1-1.6-.9l-1.3.6-1.2-2.1 1.2-.9a7 7 0 0 1 0-1.8l-1.2-.9 1.2-2.1 1.3.6a7.8 7.8 0 0 1 1.6-.9l.2-1.5h2.4l.2 1.5a7.8 7.8 0 0 1 1.5.9l1.4-.6 1.2 2.1-1.2.9a7 7 0 0 1 0 1.7Z"/></svg><span className="nav-label">Configura&#231;&#245;es</span></button>}
+          {isAdmin && <button aria-label={"Configurações"} title={"Configurações"} className={`sidebar-link ${view === "settings" ? "active" : ""}`} type="button" onClick={() => view === "settings" ? setView("library") : void openSettings()}><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="m19.4 15 .1.1 1.2.9-1.2 2.1-1.4-.6a7.8 7.8 0 0 1-1.5.9l-.2 1.5h-2.4l-.2-1.5a7.8 7.8 0 0 1-1.6-.9l-1.3.6-1.2-2.1 1.2-.9a7 7 0 0 1 0-1.8l-1.2-.9 1.2-2.1 1.3.6a7.8 7.8 0 0 1 1.6-.9l.2-1.5h2.4l.2 1.5a7.8 7.8 0 0 1 1.5.9l1.4-.6 1.2 2.1-1.2.9a7 7 0 0 1 0 1.7Z"/></svg><span className="nav-label">Configurações</span></button>}
         </nav>
       </aside>
       <main className="page-shell">
@@ -608,7 +608,9 @@ export default function App() {
         <form className="search-form topbar-search" onSubmit={handleSearch} role="search">
           <svg className="search-icon" aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4.2 4.2"/></svg>
           <input aria-label={"Pesquisar filmes e séries"} placeholder={"Pesquisar filmes e séries..."} value={query} onChange={(event) => setQuery(event.target.value)} />
-          <button type="submit" aria-label={loading ? "Pesquisando" : "Pesquisar"} disabled={loading || !query.trim()}>{loading ? "Buscando..." : "Pesquisar"}</button>
+          <button className="search-submit" type="submit" aria-label={loading ? "Pesquisando" : "Pesquisar"} disabled={loading || !query.trim()}>
+            {loading ? <span className="search-loading-indicator" aria-hidden="true" /> : <svg className="search-submit-icon" aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.8" /><path d="m16 16 4.2 4.2" /></svg>}
+          </button>
         </form>
         {currentUser && <div className="topbar-account"><span className="user-avatar" aria-hidden="true">{currentUser.slice(0, 1).toUpperCase()}</span><span className="topbar-username">{currentUser}</span><button className="logout-button" type="button" onClick={() => void handleLogout()}><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M10 17l5-5-5-5M15 12H3"/><path d="M12 3h6a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-6"/></svg><span>Sair</span></button></div>}
       </header>
@@ -635,11 +637,11 @@ export default function App() {
       ) : <>
       <section className="hero" aria-labelledby="catalog-title">
         <div className="hero-copy">
-          <span className="eyebrow"><span className="eyebrow-line" /> CAT&Aacute;LOGO PESSOAL</span>
-          <h1 id="catalog-title">Descobrir filmes e s&eacute;ries</h1>
+          <span className="eyebrow"><span className="eyebrow-line" /> CATÁLOGO PESSOAL</span>
+          <h1 id="catalog-title">Descobrir filmes e séries</h1>
         </div>
         <div className="discover-controls">
-          <div className="filter-row" role="group" aria-label="Tipo de conte&uacute;do">
+          <div className="filter-row" role="group" aria-label="Tipo de conteúdo">
             {FILTERS.map((option) => (
               <button className={`filter-chip ${filter === option.value ? "active" : ""}`} key={option.value} onClick={() => { setFilter(option.value); setExpandedRow(null); }} type="button">{option.label}</button>
             ))}
@@ -655,14 +657,14 @@ export default function App() {
         </div>
         {resumeLoading && <div className="row-message" role="status">Carregando sua atividade do Jellyfin...</div>}
         {resumeError && <div className="message error-message">{resumeError}</div>}
-        {!resumeLoading && !resumeError && resumeItems.length === 0 && <div className="row-message">Os t&iacute;tulos retom&aacute;veis da sua conta Jellyfin aparecer&atilde;o aqui.</div>}
+        {!resumeLoading && !resumeError && resumeItems.length === 0 && <div className="row-message">Os títulos retomáveis da sua conta Jellyfin aparecerão aqui.</div>}
         {resumeItems.length > 0 && (
-          <div className={`resume-grid ${expandedRow === "resume" ? "expanded" : ""}`} aria-label="T&iacute;tulos para continuar assistindo">
+          <div className={`resume-grid ${expandedRow === "resume" ? "expanded" : ""}`} aria-label="Títulos para continuar assistindo">
             {(expandedRow === "resume" ? resumeItems : resumeItems.slice(0, 6)).map((item) => (
               <a className="resume-card" href={item.open_url} target="_blank" rel="noreferrer" key={item.id} aria-label={`Abrir ${item.title} no Jellyfin, ${Math.round(item.progress)} por cento assistido`}>
                 <div className="resume-poster">
                   <img src={item.image_url} alt={`Poster de ${item.title}`} loading="lazy" />
-                  <span className="resume-type">{item.media_type === "series" ? "S&Eacute;RIE" : "FILME"}</span>
+                  <span className="resume-type">{item.media_type === "series" ? "SÉRIE" : "FILME"}</span>
                   <span className="resume-play" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 5.5v13l10-6.5-10-6.5Z" /></svg></span>
                   <span className="resume-progress" role="progressbar" aria-label={`Progresso: ${Math.round(item.progress)} por cento`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(item.progress)}><span style={{ width: `${item.progress}%` }} /></span>
                 </div>
@@ -675,16 +677,16 @@ export default function App() {
 
       <section className="results-section" aria-live="polite">
         {error && <div className="message error-message">{error}</div>}
-        {catalogSearchErrors.length > 0 && <div className="message catalog-warning"><strong>Alguns cat&aacute;logos de addons n&atilde;o responderam.</strong><span>{catalogSearchErrors.map((item) => `${item.provider}: ${item.detail}`).join(" &middot; ")}</span></div>}
-        {!error && searched && !loading && results.length === 0 && <div className="message">Nenhum resultado encontrado. Tente outro t&iacute;tulo.</div>}
-        {results.length > 0 && <div className="search-results-heading"><span className="eyebrow">RESULTADOS DA BUSCA</span><h2>{results.length} {results.length === 1 ? "t&iacute;tulo encontrado" : "t&iacute;tulos encontrados"}</h2></div>}
+        {catalogSearchErrors.length > 0 && <div className="message catalog-warning"><strong>Alguns catálogos de addons não responderam.</strong><span>{catalogSearchErrors.map((item) => `${item.provider}: ${item.detail}`).join(" · ")}</span></div>}
+        {!error && searched && !loading && results.length === 0 && <div className="message">Nenhum resultado encontrado. Tente outro título.</div>}
+        {results.length > 0 && <div className="search-results-heading"><span className="eyebrow">RESULTADOS DA BUSCA</span><h2>{results.length} {results.length === 1 ? "título encontrado" : "títulos encontrados"}</h2></div>}
         {searched ? resultSections.map(renderResultSection) : <>
-          {homeLoading && <div className="row-message" role="status">Carregando recomenda&#231;&#245;es para voc&#234;...</div>}
+          {homeLoading && <div className="row-message" role="status">Carregando recomendações para você...</div>}
           {homeError && <div className="message error-message">{homeError}</div>}
-          {!homeLoading && !homeError && tmdbConfigured === false && <div className="message catalog-warning"><strong>Recomenda&#231;&#245;es, busca bil&#237;ngue e sinopses em portugu&#234;s precisam do TMDb.</strong><span>Configure TMDB_API_TOKEN como vari&#225;vel de ambiente no Coolify para ativar recomenda&#231;&#245;es personalizadas e metadata pt-BR.</span></div>}
-          {homeWarning && <div className="message catalog-warning"><strong>O cat&#225;logo de recomenda&#231;&#245;es est&#225; temporariamente indispon&#237;vel.</strong><span>{homeWarning}</span></div>}
-          {homeSections.map((section) => renderResultSection({ key: section.id, title: section.title, items: section.items, eyebrow: section.id === "for-you" ? "PELO SEU GOSTO" : section.id === "releases" ? "ESTREIAS PR&Oacute;XIMAS" : "POPULAR AGORA" }))}
-          {!homeLoading && tmdbConfigured && homeSections.every((section) => section.items.length === 0) && <div className="catalog-empty"><span className="empty-mark" aria-hidden="true">M</span><p>Assista e marque filmes ou epis&#243;dios como vistos no Jellyfin para receber recomenda&#231;&#245;es personalizadas. Lan&#231;amentos e tend&#234;ncias aparecem aqui quando o cat&#225;logo responder.</p></div>}
+          {!homeLoading && !homeError && tmdbConfigured === false && <div className="message catalog-warning"><strong>Recomendações, busca bilíngue e sinopses em português precisam do TMDb.</strong><span>Configure TMDB_API_TOKEN como variável de ambiente no Coolify para ativar recomendações personalizadas e metadata pt-BR.</span></div>}
+          {homeWarning && <div className="message catalog-warning"><strong>O catálogo de recomendações está temporariamente indisponível.</strong><span>{homeWarning}</span></div>}
+          {homeSections.map((section) => renderResultSection({ key: section.id, title: section.title, items: section.items, eyebrow: section.id === "for-you" ? "PELO SEU GOSTO" : section.id === "releases" ? "ESTREIAS PRÓXIMAS" : "POPULAR AGORA" }))}
+          {!homeLoading && tmdbConfigured && homeSections.every((section) => section.items.length === 0) && <div className="catalog-empty"><span className="empty-mark" aria-hidden="true">M</span><p>Assista e marque filmes ou episódios como vistos no Jellyfin para receber recomendações personalizadas. Lançamentos e tendências aparecem aqui quando o catálogo responder.</p></div>}
         </>}
       </section>
       </>}
