@@ -6,14 +6,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-os.environ["DATABASE_URL"] = "sqlite:////tmp/mlm-new-functionality-test.sqlite3"
+os.environ["DATABASE_URL"] = f"sqlite:///{(Path(tempfile.gettempdir()) / 'mlm-new-functionality-test.sqlite3').as_posix()}"
 os.environ["SESSION_SECRET"] = "test-session-secret-value-at-least-32-characters"
 
 from app.jobs.manager import create_job, get_job, update_job
 from app.library import dynamic
 from app.database.db import Base, SessionLocal, engine
 from app.database.models import LibraryItem, TemporaryMedia
-from app.main import TORRENT_RETENTION_SECONDS, _episode_strm_path, _merge_search_results, _rank_search_results, _run_episode_job, _temporary_torrent_key, app, check_temporary_media_playback
+from app.main import TORRENT_RETENTION_SECONDS, _episode_strm_path, _merge_search_results, _rank_search_results, _run_episode_job, _run_torrent_download, _temporary_torrent_key, app, check_temporary_media_playback
 from app.stremio.manifest import supports
 from app.security import check_request_rate_limit
 from fastapi.testclient import TestClient
@@ -26,6 +26,47 @@ class NewFunctionalityTests(unittest.TestCase):
 
         self.assertNotEqual(first, second)
         self.assertEqual(first, "a" * 40 + ":2")
+
+    def test_torrent_worker_organizes_movie_and_episode_and_registers_expiry(self):
+        Base.metadata.create_all(bind=engine)
+        with tempfile.TemporaryDirectory() as directory:
+            movie_hash = "d" * 40
+            episode_hash = "e" * 40
+            with SessionLocal() as session:
+                session.query(TemporaryMedia).filter(TemporaryMedia.info_hash.in_([movie_hash, episode_hash + ":0"])).delete(synchronize_session=False)
+                session.query(LibraryItem).filter(LibraryItem.id.in_(["movie:tt0123000", "series:tt0123000:1:2"])).delete(synchronize_session=False)
+                session.commit()
+            media = [
+                ("movie", movie_hash, {"title": "Public Film", "year": 1930}, {"info_hash": movie_hash, "file_idx": None}),
+                ("series", episode_hash, {"title": "Public Show", "year": 2020, "year_end": None, "episodes": [{"season_number": 1, "episode_number": 2, "title": "Second Episode"}]}, {"info_hash": episode_hash, "file_idx": 0}),
+            ]
+
+            async def fake_download(info_hash, staging_path, _max_bytes, _report, _file_idx):
+                staging_path.mkdir(parents=True, exist_ok=False)
+                video = staging_path / "source.mkv"
+                video.write_bytes(b"authorized test media")
+                return video
+
+            with patch("app.main.MEDIA_ROOT", directory), patch("app.main.download_movie", new=AsyncMock(side_effect=fake_download)), patch("app.main.refresh_library", new=AsyncMock()):
+                for media_type, info_hash, details, selected in media:
+                    job = create_job("torrent_download", "test-user")
+                    season, episode = (1, 2) if media_type == "series" else (None, None)
+                    asyncio.run(_run_torrent_download(job["id"], media_type, "tt0123000", details, selected, season, episode))
+                    result = get_job(job["id"])
+                    self.assertEqual(result["status"], "completed")
+                    self.assertEqual(result["result"]["retention_seconds"], TORRENT_RETENTION_SECONDS)
+
+            movie_path = Path(directory) / "Public Film (1930)" / "Public Film (1930).mkv"
+            episode_path = Path(directory) / "Public Show (2020)" / "Season 01" / "Public Show (2020) - S01E02.mkv"
+            self.assertTrue(movie_path.is_file())
+            self.assertTrue(episode_path.is_file())
+            with SessionLocal() as session:
+                movie_record = session.get(TemporaryMedia, movie_hash)
+                episode_record = session.get(TemporaryMedia, episode_hash + ":0")
+                self.assertEqual(movie_record.path, str(movie_path))
+                self.assertEqual(episode_record.path, str(episode_path))
+                self.assertGreater(movie_record.downloaded_at, 0)
+                self.assertGreater(episode_record.downloaded_at, 0)
 
     def test_torrent_file_expires_after_eight_hours_and_waits_for_active_playback_to_end(self):
         Base.metadata.create_all(bind=engine)
