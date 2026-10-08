@@ -10,9 +10,12 @@ O Compose monta `/home/ubuntu/jellyfin/tvshows:/media`, e a biblioteca de destin
 
 Configure no Coolify `JELLYFIN_URL`, `JELLYFIN_API_KEY` e `SESSION_SECRET` (valor aleatorio, com pelo menos 32 caracteres). Mantenha esse segredo estavel: os links dos `.strm` dinamicos dependem dele. `PUBLIC_BASE_URL` deve ser o dominio HTTPS publico do app. `COOKIE_SECURE=true` funciona atras do proxy HTTPS do Coolify. Veja `.env.example` para as demais opcoes.
 
+Para as fileiras personalizadas da página inicial (baseadas no histórico assistido do Jellyfin), tendências, lançamentos e sinopses em português brasileiro, configure `TMDB_API_TOKEN` no Coolify com o **API Read Access Token** do TMDb. O token fica somente no backend. `TMDB_LANGUAGE` usa `pt-BR` por padrão. Sem esse token, a busca continua usando Cinemeta e os catálogos dos addons, mas o TMDb não consegue fornecer as recomendações nem garantir sinopses localizadas.
+
 ## Funcionalidades
 
-- Busca filmes e series em Cinemeta e agrega resultados dos catálogos dos addons que declaram `catalog.extra.search`, mantendo IMDb IDs para abrir detalhes no catálogo Cinemeta quando disponíveis. Falhas de busca dos addons são mostradas por provider.
+- Busca filmes e séries em Cinemeta, TMDb e catálogos dos addons que declaram `catalog.extra.search`; consulta nomes traduzidos e originais e mantém IMDb IDs para compatibilidade com addons. Sinopses de busca, títulos e episódios são localizados em `pt-BR` pelo TMDb quando configurado.
+- Página inicial com fileiras reais de “Para você” (recomendações a partir de filmes e episódios assistidos no Jellyfin), “Lançamentos” para os próximos 90 dias e “Em alta”. A API key do TMDb permanece no servidor.
 - Login com as credenciais do Jellyfin. O token de autenticacao nao e persistido. Apenas administradores podem mudar addons, preferencias ou arquivos da biblioteca.
 - Cadastro de Manifest URLs Stremio: leitura e validacao do manifest, resources, types e idPrefixes opcionais, seguida de chamadas aos endpoints JSON anunciados. O sistema nao faz scraping HTML nem tenta contornar protecoes externas.
 - Busca de catálogo segue o manifest: só consulta `catalog/{type}/{catalogId}/search=...json` quando aquele catálogo anuncia a propriedade `search` em `extra`. Catálogos sem essa declaração não são consultados por busca textual.
@@ -56,6 +59,7 @@ A resposta veio marcada `HIT` e `STALE` pelo cache do addon, então nenhum objet
 
 - `GET /health`
 - `GET /api/search?query=Mr.%20Robot&media_type=series` (requer sessao)
+- `GET /api/home/catalog` (requer sessao; recomendações, tendências e lançamentos)
 - `GET /api/title/series/tt4158110` (requer sessao; metadata e estado local)
 - `GET /api/library/checks/series/tt4158110` (requer sessao; ultimo estado das verificacoes dos links)
 - `GET /api/streams/series/tt4158110/1/1` (requer sessao)

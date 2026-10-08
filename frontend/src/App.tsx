@@ -1,4 +1,6 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, Suspense, lazy, useEffect, useRef, useState } from "react";
+
+const ShaderBackground = lazy(() => import("./ShaderBackground"));
 
 type MediaType = "movie" | "series";
 type SearchFilter = "all" | MediaType;
@@ -18,6 +20,9 @@ type SearchResult = {
   catalog_providers?: string[];
   catalog_search_errors?: { provider: string; detail: string }[];
 };
+
+type ResumeItem = { id: string; title: string; subtitle: string; media_type: MediaType; progress: number; image_url: string; open_url: string };
+type HomeSection = { id: string; title: string; items: SearchResult[] };
 
 type TitleDetails = SearchResult & {
   cast: { name: string; character: string; profile_url: string | null }[];
@@ -89,7 +94,16 @@ export default function App() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [currentUser, setCurrentUser] = useState("");
   const [view, setView] = useState<"library" | "settings">("library");
-  const [showAllResults, setShowAllResults] = useState(false);
+  const [expandedRow, setExpandedRow] = useState<string | null>(null);
+  const [resumeItems, setResumeItems] = useState<ResumeItem[]>([]);
+  const [resumeLoading, setResumeLoading] = useState(false);
+  const [resumeError, setResumeError] = useState("");
+  const [homeSections, setHomeSections] = useState<HomeSection[]>([]);
+  const [homeLoading, setHomeLoading] = useState(false);
+  const [homeError, setHomeError] = useState("");
+  const [homeWarning, setHomeWarning] = useState("");
+  const [tmdbConfigured, setTmdbConfigured] = useState<boolean | null>(null);
+  const [renderShader, setRenderShader] = useState(false);
   const [addons, setAddons] = useState<AddonItem[]>([]);
   const [preferences, setPreferences] = useState<Preferences>({ preferred_quality: "1080p", preferred_provider: "automatic" });
   const [addonName, setAddonName] = useState("");
@@ -112,6 +126,55 @@ export default function App() {
       setAuthState("ready");
     }).catch(() => setAuthState("login"));
   }, []);
+
+  useEffect(() => {
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const updateShaderPreference = () => setRenderShader(!reducedMotion.matches && window.innerWidth > 900);
+    updateShaderPreference();
+    window.addEventListener("resize", updateShaderPreference, { passive: true });
+    reducedMotion.addEventListener("change", updateShaderPreference);
+    return () => {
+      window.removeEventListener("resize", updateShaderPreference);
+      reducedMotion.removeEventListener("change", updateShaderPreference);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (authState !== "ready") return;
+    let active = true;
+    setResumeLoading(true);
+    fetch("/api/library/resume")
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Falha ao carregar Continuar assistindo.");
+        if (active) setResumeItems(data.items || []);
+      })
+      .catch((cause) => {
+        if (active) setResumeError(cause instanceof Error ? cause.message : "Falha ao carregar Continuar assistindo.");
+      })
+      .finally(() => { if (active) setResumeLoading(false); });
+    return () => { active = false; };
+  }, [authState]);
+
+  useEffect(() => {
+    if (authState !== "ready") return;
+    let active = true;
+    setHomeLoading(true);
+    fetch("/api/home/catalog")
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Não foi possível carregar as recomendações.");
+        if (!active) return;
+        setTmdbConfigured(Boolean(data.configured));
+        setHomeWarning(data.warning || "");
+        setHomeSections(data.sections || []);
+      })
+      .catch((cause) => {
+        if (active) setHomeError(cause instanceof Error ? cause.message : "Falha ao carregar recomendacoes.");
+      })
+      .finally(() => { if (active) setHomeLoading(false); });
+    return () => { active = false; };
+  }, [authState]);
 
   useEffect(() => () => jobEvents.current?.close(), []);
 
@@ -410,7 +473,7 @@ export default function App() {
 
     setLoading(true);
     setView("library");
-    setShowAllResults(false);
+    setExpandedRow(null);
     setSearched(true);
     setError("");
     setCatalogSearchErrors([]);
@@ -446,8 +509,68 @@ export default function App() {
     }
   }
 
+  const resultSections = (filter === "all"
+    ? [
+        { key: "movie", title: "Filmes", items: results.filter((item) => item.media_type === "movie") },
+        { key: "series", title: "Séries", items: results.filter((item) => item.media_type === "series") },
+      ]
+    : [{ key: filter, title: filter === "movie" ? "Filmes" : "Séries", items: results }]
+  ).filter((section) => section.items.length > 0);
+
+  function renderResultCard(item: SearchResult) {
+    const availability = item.availability === "available"
+      ? `Stream · ${(item.available_providers || []).join(", ")}`
+      : item.catalog_providers?.length ? `No catálogo · ${item.catalog_providers.join(", ")}`
+        : item.availability === "unavailable" ? "Sem fonte nos addons" : "Disponibilidade não confirmada";
+    return (
+      <article
+        className={`media-card search-${item.availability || "unknown"}`}
+        key={item.id}
+        role="button"
+        tabIndex={0}
+        aria-label={`Abrir detalhes de ${item.title}`}
+        onClick={() => void openDetails(item)}
+        onKeyDown={(event) => {
+          if (event.target !== event.currentTarget) return;
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            void openDetails(item);
+          }
+        }}
+      >
+        <div className="poster-wrap">
+          {item.poster_url ? <img src={item.poster_url} alt={`Pôster de ${item.title}`} loading="lazy" /> : <div className="poster-placeholder"><span>Sem capa disponível</span></div>}
+          <span className="media-type">{item.media_type === "series" ? "SÉRIE" : "FILME"}</span>
+        </div>
+        <div className="card-copy">
+          <div className="card-title-row"><h3>{item.title}</h3>{item.year && <span className="year">{item.year}</span>}</div>
+          <span className={`availability-pill ${item.catalog_providers?.length ? "catalog-listed" : item.availability || "unknown"}`}>{availability}</span>
+          <p>{item.overview || "Sinopse indisponível."}</p>
+          <div className="card-footer"><span>IMDb <b>{item.imdb_id || "—"}</b></span><span className="details-button">Ver elenco e detalhes <span aria-hidden="true">↗</span></span></div>
+        </div>
+      </article>
+    );
+  }
+
+  function renderResultSection(section: { key: string; title: string; items: SearchResult[]; eyebrow?: string }) {
+    const expanded = expandedRow === section.key;
+    const visibleItems = expanded ? section.items : section.items.slice(0, 12);
+    return (
+      <section className="media-row" key={section.key} aria-labelledby={`row-${section.key}`}>
+        <div className="section-heading">
+          <div><span className="eyebrow">{section.eyebrow || "PESQUISA"}</span><h2 id={`row-${section.key}`}>{section.title}</h2></div>
+          <div className="results-actions"><span className="result-count">{section.items.length} {section.items.length === 1 ? "título" : "títulos"}</span>{section.items.length > 12 && <button className="view-all-button" type="button" aria-expanded={expanded} onClick={() => setExpandedRow(expanded ? null : section.key)}>{expanded ? "Recolher" : "Ver todos"}<span aria-hidden="true">{expanded ? "−" : "›"}</span></button>}</div>
+        </div>
+        <div className={`results-grid ${expanded ? "expanded" : ""}`} tabIndex={0} aria-label={`${section.title} encontrados`}>
+          {visibleItems.map(renderResultCard)}
+        </div>
+      </section>
+    );
+  }
+
   return (
     <div className="app-layout">
+      {renderShader && <div className="ambient-layer" aria-hidden="true"><Suspense fallback={null}><ShaderBackground /></Suspense></div>}
       <aside className="sidebar">
         <a className="brand" href="/" aria-label="Media Library Manager" title="Media Library Manager">
           <span className="brand-mark">M</span>
@@ -488,70 +611,60 @@ export default function App() {
           </div>}
         </section>
       ) : <>
-      <section className="hero">
-        <div className="eyebrow"><span className="eyebrow-line" /> BIBLIOTECA PESSOAL</div>
-        <h1>Encontre o que<br /><span>você quer assistir.</span></h1>
-        <p>Pesquise filmes e séries para organizar sua biblioteca Jellyfin.</p>
-
-        <div className="filter-row" role="group" aria-label="Tipo de conteúdo">
-          {FILTERS.map((option) => (
-            <button
-              className={`filter-chip ${filter === option.value ? "active" : ""}`}
-              key={option.value}
-              onClick={() => { setFilter(option.value); setShowAllResults(false); }}
-              type="button"
-            >
-              {option.label}
-            </button>
-          ))}
+      <section className="hero" aria-labelledby="catalog-title">
+        <div className="hero-copy">
+          <span className="eyebrow"><span className="eyebrow-line" /> CAT&Aacute;LOGO PESSOAL</span>
+          <h1 id="catalog-title">Descobrir filmes e s&eacute;ries</h1>
         </div>
-        <div className="search-hint">Experimente <button onClick={() => setQuery("Mr. Robot")}>Mr. Robot</button> ou <button onClick={() => setQuery("The Office")}>The Office</button></div>
+        <div className="discover-controls">
+          <div className="filter-row" role="group" aria-label="Tipo de conte&uacute;do">
+            {FILTERS.map((option) => (
+              <button className={`filter-chip ${filter === option.value ? "active" : ""}`} key={option.value} onClick={() => { setFilter(option.value); setExpandedRow(null); }} type="button">{option.label}</button>
+            ))}
+          </div>
+          <div className="search-hint">Experimente <button type="button" onClick={() => setQuery("Mr. Robot")}>Mr. Robot</button> ou <button type="button" onClick={() => setQuery("The Office")}>The Office</button></div>
+        </div>
+      </section>
+
+      <section className="resume-section" aria-labelledby="resume-title">
+        <div className="section-heading">
+          <div><span className="eyebrow">JELLYFIN</span><h2 id="resume-title">Continuar assistindo</h2></div>
+          <div className="results-actions"><span className="result-count">{resumeItems.length ? `${resumeItems.length} itens` : "Sua atividade"}</span>{resumeItems.length > 6 && <button className="view-all-button" type="button" aria-expanded={expandedRow === "resume"} onClick={() => setExpandedRow(expandedRow === "resume" ? null : "resume")}>{expandedRow === "resume" ? "Recolher" : "Ver todos"}<span aria-hidden="true">{expandedRow === "resume" ? "\u2212" : "\u203a"}</span></button>}</div>
+        </div>
+        {resumeLoading && <div className="row-message" role="status">Carregando sua atividade do Jellyfin...</div>}
+        {resumeError && <div className="message error-message">{resumeError}</div>}
+        {!resumeLoading && !resumeError && resumeItems.length === 0 && <div className="row-message">Os t&iacute;tulos retom&aacute;veis da sua conta Jellyfin aparecer&atilde;o aqui.</div>}
+        {resumeItems.length > 0 && (
+          <div className={`resume-grid ${expandedRow === "resume" ? "expanded" : ""}`} aria-label="T&iacute;tulos para continuar assistindo">
+            {(expandedRow === "resume" ? resumeItems : resumeItems.slice(0, 6)).map((item) => (
+              <a className="resume-card" href={item.open_url} target="_blank" rel="noreferrer" key={item.id} aria-label={`Abrir ${item.title} no Jellyfin, ${Math.round(item.progress)} por cento assistido`}>
+                <div className="resume-poster">
+                  <img src={item.image_url} alt={`Poster de ${item.title}`} loading="lazy" />
+                  <span className="resume-type">{item.media_type === "series" ? "S&Eacute;RIE" : "FILME"}</span>
+                  <span className="resume-play" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 5.5v13l10-6.5-10-6.5Z" /></svg></span>
+                  <span className="resume-progress" role="progressbar" aria-label={`Progresso: ${Math.round(item.progress)} por cento`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(item.progress)}><span style={{ width: `${item.progress}%` }} /></span>
+                </div>
+                <div className="resume-copy"><h3>{item.title}</h3><p>{item.subtitle}</p></div>
+              </a>
+            ))}
+          </div>
+        )}
       </section>
 
       <section className="results-section" aria-live="polite">
         {error && <div className="message error-message">{error}</div>}
-        {catalogSearchErrors.length > 0 && <div className="message catalog-warning"><strong>Alguns catálogos de addons não responderam.</strong><span>{catalogSearchErrors.map((item) => `${item.provider}: ${item.detail}`).join(" · ")}</span></div>}
-        {!error && searched && !loading && results.length === 0 && (
-          <div className="message">Nenhum resultado encontrado. Tente outro título.</div>
-        )}
-        {results.length > 0 && (
-          <>
-            <div className="section-heading">
-              <div><span className="eyebrow">RESULTADOS</span><h2>{results.length} títulos encontrados</h2></div>
-              <div className="results-actions"><span className="result-count">{results.length} itens</span><button className="view-all-button" type="button" aria-expanded={showAllResults} onClick={() => setShowAllResults((visible) => !visible)}>{showAllResults ? "Recolher" : "Ver todos"}<span aria-hidden="true">{showAllResults ? "\u2212" : "\u203a"}</span></button></div>
-            </div>
-            <div className={`results-grid ${showAllResults ? "expanded" : ""}`}>
-              {results.map((item) => (
-                <article className={`media-card search-${item.availability || "unknown"}`} key={item.id}>
-                  <div className="poster-wrap">
-                    {item.poster_url ? (
-                      <img src={item.poster_url} alt={`Poster de ${item.title}`} loading="lazy" />
-                    ) : (
-                      <div className="poster-placeholder"><span>ML</span></div>
-                    )}
-                    <span className="media-type">{item.media_type === "series" ? "SÉRIE" : "FILME"}</span>
-                  </div>
-                  <div className="card-copy">
-                    <div className="card-title-row"><h3>{item.title}</h3>{item.year && <span className="year">{item.year}</span>}</div>
-                    <span className={`availability-pill ${item.catalog_providers?.length ? "catalog-listed" : item.availability || "unknown"}`}>
-                      {item.availability === "available"
-                        ? `Stream · ${(item.available_providers || []).join(", ")}`
-                        : item.catalog_providers?.length ? `No catálogo · ${item.catalog_providers.join(", ")}`
-                          : item.availability === "unavailable" ? "Sem fonte nos addons" : "Disponibilidade não confirmada"}
-                    </span>
-                    <p>{item.overview || "Sinopse indisponível."}</p>
-                    <div className="card-footer">
-                      <span>IMDb <b>{item.imdb_id}</b></span>
-                      <button className="details-button" onClick={() => openDetails(item)} type="button">Ver elenco e detalhes <span aria-hidden="true">↗</span></button>
-                    </div>
-                  </div>
-                </article>
-              ))}
-            </div>
-          </>
-        )}
+        {catalogSearchErrors.length > 0 && <div className="message catalog-warning"><strong>Alguns cat&aacute;logos de addons n&atilde;o responderam.</strong><span>{catalogSearchErrors.map((item) => `${item.provider}: ${item.detail}`).join(" &middot; ")}</span></div>}
+        {!error && searched && !loading && results.length === 0 && <div className="message">Nenhum resultado encontrado. Tente outro t&iacute;tulo.</div>}
+        {results.length > 0 && <div className="search-results-heading"><span className="eyebrow">RESULTADOS DA BUSCA</span><h2>{results.length} {results.length === 1 ? "t&iacute;tulo encontrado" : "t&iacute;tulos encontrados"}</h2></div>}
+        {searched ? resultSections.map(renderResultSection) : <>
+          {homeLoading && <div className="row-message" role="status">Carregando recomenda&#231;&#245;es para voc&#234;...</div>}
+          {homeError && <div className="message error-message">{homeError}</div>}
+          {!homeLoading && !homeError && tmdbConfigured === false && <div className="message catalog-warning"><strong>Recomenda&#231;&#245;es, busca bil&#237;ngue e sinopses em portugu&#234;s precisam do TMDb.</strong><span>Configure TMDB_API_TOKEN como vari&#225;vel de ambiente no Coolify para ativar recomenda&#231;&#245;es personalizadas e metadata pt-BR.</span></div>}
+          {homeWarning && <div className="message catalog-warning"><strong>O cat&#225;logo de recomenda&#231;&#245;es est&#225; temporariamente indispon&#237;vel.</strong><span>{homeWarning}</span></div>}
+          {homeSections.map((section) => renderResultSection({ key: section.id, title: section.title, items: section.items, eyebrow: section.id === "for-you" ? "PELO SEU GOSTO" : section.id === "releases" ? "ESTREIAS PR&Oacute;XIMAS" : "POPULAR AGORA" }))}
+          {!homeLoading && tmdbConfigured && homeSections.every((section) => section.items.length === 0) && <div className="catalog-empty"><span className="empty-mark" aria-hidden="true">M</span><p>Assista e marque filmes ou epis&#243;dios como vistos no Jellyfin para receber recomenda&#231;&#245;es personalizadas. Lan&#231;amentos e tend&#234;ncias aparecem aqui quando o cat&#225;logo responder.</p></div>}
+        </>}
       </section>
-
       </>}
 
       <footer className="footer"><span>MEDIA LIBRARY MANAGER</span><span>METADATA POR TMDb</span></footer>

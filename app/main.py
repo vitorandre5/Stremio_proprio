@@ -8,7 +8,7 @@ import re
 import shutil
 import time
 import unicodedata
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from fastapi import Depends, FastAPI, File, HTTPException, Path as PathParam, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
@@ -19,12 +19,15 @@ from typing import Literal
 
 from app.database.db import Base, SessionLocal, engine
 from app.database.models import Addon, Job, LibraryItem, LinkCheck, MetadataItem, Preference, TemporaryMedia
-from app.jellyfin.client import authenticate_user, item_marked_played, playback_sessions, refresh_library
+from app.jellyfin.client import authenticate_user, item_image as get_jellyfin_item_image, item_marked_played, playback_sessions, refresh_library, resume_items as get_resume_items, user_item as get_jellyfin_user_item, watched_media as get_watched_media
 from app.library.dynamic import dynamic_signature, dynamic_strm_url, verify_dynamic_signature
 from app.library.service import scan_movie, scan_series, series_folder_name, title_folder_name
-from app.config import BESTCINE_MANIFEST_URL, BRAZUCA_TORRENTS_MANIFEST_URL, COOKIE_SECURE, FENIXFLIX_MANIFEST_URL, FROST_MANIFEST_URL, JELLYFIN_API_KEY, LINK_CHECK_INTERVAL_SECONDS, MAX_TORRENT_BYTES, MAX_UPLOAD_BYTES, MEDIA_ROOT
+from app.config import BESTCINE_MANIFEST_URL, BRAZUCA_TORRENTS_MANIFEST_URL, COOKIE_SECURE, FENIXFLIX_MANIFEST_URL, FROST_MANIFEST_URL, JELLYFIN_API_KEY, JELLYFIN_URL, LINK_CHECK_INTERVAL_SECONDS, MAX_TORRENT_BYTES, MAX_UPLOAD_BYTES, MEDIA_ROOT, TMDB_API_TOKEN
 from app.metadata.cinemeta import details as get_metadata_details
-from app.metadata.cinemeta import search as search_metadata
+from app.metadata.service import details as get_localized_metadata_details
+from app.metadata.service import localize_results as localize_metadata_results
+from app.metadata.service import search as search_metadata
+from app.metadata.tmdb import home_catalog as get_tmdb_home_catalog, tmdb_id_for_imdb
 from app.stremio.client import read_manifest as read_addon_manifest
 from app.stremio.resolver import find_catalog_search_results, find_direct_streams, sort_streams, sort_torrents
 from app.security import (
@@ -241,6 +244,96 @@ async def session_status(request: Request, _: None = Depends(require_session)) -
     return {"authenticated": True, "csrf_token": request.cookies.get(CSRF_COOKIE), "user": session_user(request.cookies.get(SESSION_COOKIE))}
 
 
+@app.get("/api/library/resume")
+async def library_resume(request: Request, _: None = Depends(require_session)) -> dict:
+    user = request.state.user
+    records = await get_resume_items(user["user_id"])
+    items = []
+    base_url = JELLYFIN_URL.rstrip("/")
+    for record in records:
+        item_id = record.get("Id")
+        if not isinstance(item_id, str) or not re.fullmatch(r"[0-9a-fA-F-]{32,36}", item_id):
+            continue
+        runtime = int(record.get("RunTimeTicks") or 0)
+        user_data = record.get("UserData") if isinstance(record.get("UserData"), dict) else {}
+        position = int(user_data.get("PlaybackPositionTicks") or 0)
+        if runtime <= 0 or position <= 0:
+            continue
+        progress = float(user_data.get("PlayedPercentage") or (position / runtime * 100))
+        if progress >= 100:
+            continue
+        is_episode = record.get("Type") == "Episode"
+        season = record.get("ParentIndexNumber")
+        episode = record.get("IndexNumber")
+        episode_code = f"S{int(season):02d}E{int(episode):02d}" if is_episode and isinstance(season, int) and isinstance(episode, int) else ""
+        image_id = record.get("SeriesId") if is_episode else item_id
+        if not isinstance(image_id, str) or not re.fullmatch(r"[0-9a-fA-F-]{32,36}", image_id):
+            image_id = item_id
+        items.append({
+            "id": item_id,
+            "title": record.get("SeriesName") if is_episode and record.get("SeriesName") else record.get("Name", "Sem título"),
+            "subtitle": f"{episode_code} · {record.get('Name', '')}".strip(" ·") if is_episode else "Filme",
+            "media_type": "series" if is_episode else "movie",
+            "progress": max(0, min(progress, 99.9)),
+            "image_url": f"/api/jellyfin/items/{quote(image_id, safe='')}/image",
+            "open_url": f"{base_url}/web/index.html#!/details?id={quote(item_id, safe='')}",
+        })
+    return {"items": items}
+
+
+@app.get("/api/home/catalog")
+async def home_catalog(request: Request, _: None = Depends(require_session)) -> dict:
+    if not TMDB_API_TOKEN:
+        return {"configured": False, "sections": []}
+    user_id = request.state.user["user_id"]
+    try:
+        history = await get_watched_media(user_id, limit=60)
+    except HTTPException:
+        history = []
+    seeds: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    hydrated_series: dict[str, dict | None] = {}
+    for record in history:
+        media_type = "movie" if record.get("Type") == "Movie" else "series" if record.get("Type") == "Episode" else None
+        if media_type == "series":
+            series_id = record.get("SeriesId")
+            if not isinstance(series_id, str) or not re.fullmatch(r"[0-9a-fA-F-]{32,36}", series_id):
+                continue
+            if series_id not in hydrated_series:
+                hydrated_series[series_id] = await get_jellyfin_user_item(user_id, series_id)
+            record = hydrated_series[series_id]
+            if not record:
+                continue
+            media_type = "series"
+        if media_type is None:
+            continue
+        provider_ids = record.get("ProviderIds") if isinstance(record.get("ProviderIds"), dict) else {}
+        raw_tmdb_id = provider_ids.get("Tmdb") or provider_ids.get("tmdb")
+        tmdb_id = int(raw_tmdb_id) if isinstance(raw_tmdb_id, (int, str)) and str(raw_tmdb_id).isdigit() else None
+        if tmdb_id is None:
+            imdb_id = provider_ids.get("Imdb") or provider_ids.get("imdb")
+            if isinstance(imdb_id, str) and re.fullmatch(r"tt\d+", imdb_id):
+                try:
+                    tmdb_id = await tmdb_id_for_imdb(imdb_id, media_type)
+                except Exception:
+                    tmdb_id = None
+        if tmdb_id is None:
+            continue
+        key = (media_type, tmdb_id)
+        if key not in seen:
+            seen.add(key)
+            seeds.append(key)
+        if len(seeds) >= 4:
+            break
+    return await get_tmdb_home_catalog(seeds)
+
+
+@app.get("/api/jellyfin/items/{item_id}/image")
+async def jellyfin_item_image(item_id: str, _: None = Depends(require_session)) -> Response:
+    content, media_type = await get_jellyfin_item_image(item_id)
+    return Response(content=content, media_type=media_type, headers={"Cache-Control": "private, max-age=3600"})
+
+
 @app.post("/api/login")
 async def login(payload: LoginPayload, request: Request, response: Response) -> dict:
     client_ip = request.client.host if request.client else "unknown"
@@ -291,10 +384,8 @@ async def search(
         catalog_response = await find_catalog_search_results(addon_config, requested_type, normalized_query)
         catalog_metas.extend(catalog_response["metas"])
         catalog_errors.extend(catalog_response["addon_errors"])
-    results = await _rank_search_results(
-        normalized_query,
-        _merge_search_results(metadata_results, catalog_metas),
-    )
+    merged_results = await localize_metadata_results(_merge_search_results(metadata_results, catalog_metas))
+    results = await _rank_search_results(normalized_query, merged_results)
     unique_errors = {(item["provider"], item["detail"]): item for item in catalog_errors}
     with SessionLocal() as session:
         for item in results:
@@ -366,6 +457,12 @@ def _search_title_rank(query: str, title: str) -> int:
     return 4
 
 
+def _search_item_title_rank(query: str, item: dict) -> int:
+    titles = list(item.get("search_titles")) if isinstance(item.get("search_titles"), list) else []
+    titles.extend([item.get("title", ""), item.get("original_title", "")])
+    return min((_search_title_rank(query, title) for title in titles if isinstance(title, str) and title), default=4)
+
+
 async def _rank_search_results(query: str, results: list[dict]) -> list[dict]:
     semaphore = asyncio.Semaphore(8)
     now = time.monotonic()
@@ -406,7 +503,7 @@ async def _rank_search_results(query: str, results: list[dict]) -> list[dict]:
     for original_rank, (item, (status, providers)) in enumerate(zip(results, checks)):
         ranked_item = {**item, "availability": status, "available_providers": providers}
         source_rank = 0 if status == "available" else 1 if item.get("catalog_providers") else availability_rank[status] + 1
-        ranked.append((source_rank, _search_title_rank(query, item["title"]), original_rank, ranked_item))
+        ranked.append((source_rank, _search_item_title_rank(query, item), original_rank, ranked_item))
     ranked.sort(key=lambda entry: entry[:3])
     return [entry[3] for entry in ranked]
 
@@ -415,7 +512,7 @@ async def _rank_search_results(query: str, results: list[dict]) -> list[dict]:
 async def title_details(
     media_type: Literal["movie", "series"], imdb_id: str, _: None = Depends(require_session)
 ) -> dict:
-    details = await get_metadata_details(media_type, imdb_id)
+    details = await get_localized_metadata_details(media_type, imdb_id)
     with SessionLocal() as session:
         record = session.get(MetadataItem, details["id"])
         if record is None:

@@ -9,6 +9,60 @@ from app import security
 
 
 class JellyfinAuthenticationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reads_resume_items_for_session_user_without_exposing_server_key(self):
+        user_id = "a1a1a1a1111141118111111111111111"
+        item = {"Id": "b2b2b2b2222242228222222222222222", "Name": "Episode", "UserData": {"PlaybackPositionTicks": 1}}
+        response = httpx.Response(200, json={"Items": [item]}, request=httpx.Request("GET", "https://jf.example.test/Users/" + user_id + "/Items/Resume"))
+        with patch.object(jellyfin_client, "JELLYFIN_URL", "https://jf.example.test"), patch.object(jellyfin_client, "JELLYFIN_API_KEY", "server-only-key"), patch.object(jellyfin_client.httpx, "AsyncClient") as client_type:
+            client = client_type.return_value.__aenter__.return_value
+            client.get = AsyncMock(return_value=response)
+
+            items = await jellyfin_client.resume_items(user_id)
+
+        self.assertEqual(items, [item])
+        args, kwargs = client.get.await_args
+        self.assertEqual(args[0], f"https://jf.example.test/Users/{user_id}/Items/Resume")
+        self.assertEqual(kwargs["headers"], {"X-Emby-Token": "server-only-key"})
+        self.assertEqual(kwargs["params"]["MediaTypes"], "Video")
+        self.assertNotIn("server-only-key", repr(items))
+
+    async def test_resume_rejects_invalid_user_id(self):
+        with patch.object(jellyfin_client, "JELLYFIN_URL", "https://jf.example.test"), patch.object(jellyfin_client, "JELLYFIN_API_KEY", "server-only-key"):
+            with self.assertRaises(HTTPException) as raised:
+                await jellyfin_client.resume_items("not-a-user-id")
+        self.assertEqual(raised.exception.status_code, 401)
+
+    async def test_reads_recently_watched_movies_and_episodes_for_recommendations(self):
+        user_id = "a1a1a1a1-1111-4111-8111-111111111111"
+        item = {"Id": "b2b2b2b2-2222-4222-8222-222222222222", "Type": "Movie", "ProviderIds": {"Tmdb": "603"}}
+        response = httpx.Response(200, json={"Items": [item]}, request=httpx.Request("GET", f"https://jf.example.test/Users/{user_id}/Items"))
+        with patch.object(jellyfin_client, "JELLYFIN_URL", "https://jf.example.test"), patch.object(jellyfin_client, "JELLYFIN_API_KEY", "server-only-key"), patch.object(jellyfin_client.httpx, "AsyncClient") as client_type:
+            client = client_type.return_value.__aenter__.return_value
+            client.get = AsyncMock(return_value=response)
+
+            items = await jellyfin_client.watched_media(user_id, limit=60)
+
+        self.assertEqual(items, [item])
+        args, kwargs = client.get.await_args
+        self.assertEqual(args[0], f"https://jf.example.test/Users/{user_id}/Items")
+        self.assertEqual(kwargs["params"]["IncludeItemTypes"], "Movie,Episode")
+        self.assertEqual(kwargs["params"]["Filters"], "IsPlayed")
+        self.assertEqual(kwargs["params"]["SortBy"], "DatePlayed")
+        self.assertEqual(kwargs["headers"], {"X-Emby-Token": "server-only-key"})
+
+    async def test_fetches_jellyfin_cover_with_server_key(self):
+        item_id = "b2b2b2b2222242228222222222222222"
+        response = httpx.Response(200, content=b"image-data", headers={"content-type": "image/webp"}, request=httpx.Request("GET", "https://jf.example.test/Items/" + item_id + "/Images/Primary"))
+        with patch.object(jellyfin_client, "JELLYFIN_URL", "https://jf.example.test"), patch.object(jellyfin_client, "JELLYFIN_API_KEY", "server-only-key"), patch.object(jellyfin_client.httpx, "AsyncClient") as client_type:
+            client = client_type.return_value.__aenter__.return_value
+            client.get = AsyncMock(return_value=response)
+
+            content, media_type = await jellyfin_client.item_image(item_id)
+
+        self.assertEqual(content, b"image-data")
+        self.assertEqual(media_type, "image/webp")
+        self.assertEqual(client.get.await_args.kwargs["headers"], {"X-Emby-Token": "server-only-key"})
+
     async def test_reads_active_sessions_and_played_state_with_server_key(self):
         user_id = "a1a1a1a1-1111-4111-8111-111111111111"
         item_id = "b2b2b2b2-2222-4222-8222-222222222222"
